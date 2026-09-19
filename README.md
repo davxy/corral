@@ -28,7 +28,8 @@ home.
 ## Requirements
 
 `bubblewrap`, and `passt` for the default network mode. Neither needs root,
-and neither needs you in a privileged group.
+and neither needs you in a privileged group. Python 3.11 or newer, for the
+`tomllib` that reads the config files.
 
 ```
 sudo pacman -S bubblewrap passt          # Arch
@@ -42,7 +43,7 @@ says so instead of leaving `bwrap` to fail on an unknown option.
 
 ## Configuration
 
-Settings live in `~/.config/corral/config.json` (or under `$XDG_CONFIG_HOME`).
+Settings live in `~/.config/corral/config.toml` (or under `$XDG_CONFIG_HOME`).
 
 | key | meaning |
 |-----|---------|
@@ -57,21 +58,19 @@ about that one alone. Delete the file to be asked everything again.
 `homes` defaults to `~/.local/share/corral/homes`.
 
 Settings that belong to one project go in its own
-[`.corral.json`](#the-project-file) instead.
+[`.corral.toml`](#the-project-file) instead.
 
 ## The project file
 
-A `.corral.json` in the project directory holds the flags that the project
+A `.corral.toml` in the project directory holds the flags that the project
 always needs, so that nobody retypes them and everyone who clones the
 repository gets the same sandbox:
 
-```json
-{
-  "network": "host",
-  "user": "myproject",
-  "mounts": ["../core", "/data/fixtures:/data:ro"],
-  "env": ["RUST_LOG=debug"]
-}
+```toml
+network = "host"
+user = "myproject"
+mounts = ["../core", "/data/fixtures:/data:ro"]
+env = ["RUST_LOG=debug"]
 ```
 
 The four keys stand for `-n`, `-u`, `-m` and `-e`, with the same syntax and
@@ -93,7 +92,7 @@ added, as the flags it stands for, minus the entries a flag replaced:
 
 ```
 $ corral
-.corral.json: -n host -u myproject -m ../core -m /data/fixtures:/data:ro -e RUST_LOG=debug
+.corral.toml: -n host -u myproject -m ../core -m /data/fixtures:/data:ro -e RUST_LOG=debug
 ```
 
 That line is the whole safeguard for a repository you did not write. The guard
@@ -255,7 +254,7 @@ sources too, with `--force` overriding it as usual. There is deliberately no
 key for this in the global config. A mount that persisted invisibly across
 sessions is a hole you would forget about, while a flag you retype keeps it
 intentional. A mount that one project always needs goes in that project's
-[`.corral.json`](#the-project-file), which is committed and shows in every
+[`.corral.toml`](#the-project-file), which is committed and shows in every
 diff.
 
 When the guest path does not exist on the read-only rootfs, `corral` replaces
@@ -340,7 +339,7 @@ the alternate screen, which terminals keep no scrollback for.
 `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` restores the stock rendering.
 
 The flag is per run by design. For a variable that one project always needs,
-use its [`.corral.json`](#the-project-file). For one you always want, export
+use its [`.corral.toml`](#the-project-file). For one you always want, export
 it from the sandbox home's `.bashrc`, above the guard that returns early for
 non-interactive shells, so that a command run without the prompt picks it up
 too.
@@ -531,18 +530,18 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 142 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 145 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
-that empties it, and that a `.corral.json` adds what it says and no more.
+that empties it, and that a `.corral.toml` adds what it says and no more.
 
 ```
 $ ./tests/corral-test
 ...
-137 passed, 0 failed, 5 skipped
+141 passed, 0 failed, 4 skipped
 ```
 
-It needs no configuration: it writes its own `config.json` under a temporary
+It needs no configuration: it writes its own `config.toml` under a temporary
 `XDG_CONFIG_HOME`, so an existing one is neither read nor disturbed. It writes
 under two temporary directories, one in `$TMPDIR` and one under `$HOME`,
 because *a project below `/home` still works* is one of the properties being

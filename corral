@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 CWD = Path.cwd().resolve()
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.json"
+CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.toml"
 
 # The flags a project ships with, read from the working directory only. A file
 # found by walking upward is one the caller may never have read.
-PROJECT_FILE = ".corral.json"
+PROJECT_FILE = ".corral.toml"
 PROJECT_KEYS = ("network", "user", "mounts", "env")
 
 FORCE_REMEDY = "Pass --force to override."
@@ -401,21 +401,31 @@ def build_command(config, project, args):
     return command
 
 
-def read_object(path, label):
+def read_table(path, label):
     try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError as error:
+        return tomllib.loads(path.read_text())
+    except tomllib.TOMLDecodeError as error:
         raise SystemExit(f"malformed {label}: {error}")
-    if not isinstance(data, dict):
-        raise SystemExit(f"malformed {label}: expected an object")
-    return data
+
+
+def dump_table(table):
+    """Emit what the config holds, which is a flat table of strings.
+
+    tomllib only reads, and a whole TOML writer to put four settings back is
+    more than the four settings are worth.
+    """
+    lines = []
+    for key, value in table.items():
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'{key} = "{escaped}"\n')
+    return "".join(lines)
 
 
 def read_project():
     path = CWD / PROJECT_FILE
     if not path.is_file():
         return {}
-    project = read_object(path, f"'{PROJECT_FILE}'")
+    project = read_table(path, f"'{PROJECT_FILE}'")
     if "force" in project:
         raise SystemExit(f"refusing 'force' from '{PROJECT_FILE}': only the command line can "
                          f"lift the guard on the home directory and '/'.")
@@ -464,7 +474,7 @@ def project_flags(project, args):
 def load_config():
     config = {}
     if CONFIG_PATH.exists():
-        config = read_object(CONFIG_PATH, f"config '{CONFIG_PATH}'")
+        config = read_table(CONFIG_PATH, f"config '{CONFIG_PATH}'")
 
     modified = []
     ask_config(config, "homes", "Sandboxed homes root", modified,
@@ -475,7 +485,7 @@ def load_config():
 
     if modified:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+        CONFIG_PATH.write_text(dump_table(config))
         print(f"Config saved to '{CONFIG_PATH}'!")
 
     Path(config["homes"]).expanduser().mkdir(parents=True, exist_ok=True)
