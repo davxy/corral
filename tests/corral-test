@@ -68,7 +68,7 @@ PSTATUS=0
 probe() {
     local dir=$1 code=$2 out
     shift 2
-    out=$(cd "$dir" && "$CORRAL_BIN" "$@" -x sh -c "echo __B__; { $code ; } 2>&1; echo __E__" 2>&1)
+    out=$(cd "$dir" && "$CORRAL_BIN" "$@" sh -c "echo __B__; { $code ; } 2>&1; echo __E__" 2>&1)
     printf '%s' "$out" | sed -n '/^__B__$/,/^__E__$/{//!p;}'
 }
 
@@ -105,12 +105,12 @@ is 'getpwuid agrees with HOME' '/home/corral' \
 is 'the hostname is fixed' 'corral' "$(probe "$PROJECT" 'cat /proc/sys/kernel/hostname')"
 is 'the sandbox runs as uid 0' '0' "$(probe "$PROJECT" 'id -u')"
 
-out=$(cd "$PROJECT" && CORRAL=1 CORRAL_USER=outer "$CORRAL_BIN" -x true 2>&1); status=$?
+out=$(cd "$PROJECT" && CORRAL=1 CORRAL_USER=outer "$CORRAL_BIN" true 2>&1); status=$?
 isnt 'nesting is refused' '0' "$status"
 has  'the refusal names the outer sandbox' 'outer' "$out"
 is   'unsetting CORRAL nests deliberately' '1' \
      "$(cd "$PROJECT" && CORRAL=1 env -u CORRAL "$CORRAL_BIN" \
-        -x sh -c 'echo __B__; echo "$CORRAL"; echo __E__' 2>&1 \
+        sh -c 'echo __B__; echo "$CORRAL"; echo __E__' 2>&1 \
         | sed -n '/^__B__$/,/^__E__$/{//!p;}')"
 
 
@@ -123,7 +123,7 @@ is '-e NAME=VALUE sets a variable' 'debug' \
 is '-e NAME forwards the host value' 'from-host' \
    "$(CORRAL_TEST_TOKEN=from-host probe "$PROJECT" 'echo "${CORRAL_TEST_TOKEN:-unset}"' \
       -e CORRAL_TEST_TOKEN)"
-corral_err "$PROJECT" -e CORRAL_TEST_ABSENT -x true
+corral_err "$PROJECT" -e CORRAL_TEST_ABSENT true
 isnt 'forwarding an unset variable fails' '0' "$PSTATUS"
 has  'the failure says the host does not have it' 'not set on the host' "$ERR_OUT"
 is 'SSH_AUTH_SOCK is dropped' 'unset' \
@@ -233,13 +233,13 @@ probe "$PROJECT" 'echo out > /data/written' -m "$TMP/data:/data:rw" >/dev/null
 is 'a rw mount lands on the host' 'out' "$(cat "$TMP/data/written" 2>&1)"
 is 'an explicit guest path is honoured' 'shared' \
    "$(probe "$PROJECT" 'cat /elsewhere/file' -m "$TMP/sibling:/elsewhere")"
-corral_err "$PROJECT" -m "$TMP/absent" -x true
+corral_err "$PROJECT" -m "$TMP/absent" true
 isnt 'a missing mount source fails' '0' "$PSTATUS"
 has  'the failure names the source' 'does not exist' "$ERR_OUT"
-corral_err "$PROJECT" -m "$TMP/sibling:relative" -x true
+corral_err "$PROJECT" -m "$TMP/sibling:relative" true
 isnt 'a relative guest path fails' '0' "$PSTATUS"
 has  'the failure asks for an absolute path' 'absolute path' "$ERR_OUT"
-corral_err "$PROJECT" -m "$TMP/sibling:/x:rx" -x true
+corral_err "$PROJECT" -m "$TMP/sibling:/x:rx" true
 isnt 'an unknown mount mode fails' '0' "$PSTATUS"
 has  'the failure lists the modes' "expected 'ro', 'rw' or 'tmp'" "$ERR_OUT"
 
@@ -399,12 +399,37 @@ corral_err "$PROJECT" --dry-run
 is  '--dry-run succeeds' '0' "$PSTATUS"
 has '--dry-run prints the bwrap command' 'bwrap' "$ERR_OUT"
 is  '--dry-run does not run anything' 'gone' \
-    "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run -x touch "$PROJECT/dryrun" >/dev/null 2>&1
+    "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run touch "$PROJECT/dryrun" >/dev/null 2>&1
        [ -e "$PROJECT/dryrun" ] && echo there || echo gone)"
-(cd "$PROJECT" && "$CORRAL_BIN" -x sh -c 'exit 42' >/dev/null 2>&1)
+(cd "$PROJECT" && "$CORRAL_BIN" sh -c 'exit 42' >/dev/null 2>&1)
 is  'the command exit status propagates' '42' "$?"
-out=$(cd "$PROJECT" && "$CORRAL_BIN" -x true 2>&1 >/dev/null)
+out=$(cd "$PROJECT" && "$CORRAL_BIN" true 2>&1 >/dev/null)
 is  'a good run says nothing on stderr' '' "$out"
+
+# The command is a positional, so corral stops at the first word that is not an
+# option. Everything after that word has to reach the command untouched, even a
+# flag corral owns itself, and a typo in a corral option has to fail rather than
+# become part of the command.
+# stderr is dropped on purpose: a parse error repeats the arguments back, so a
+# search of the combined output finds the very words the command was meant to
+# print and the assertion passes without the command ever running.
+has 'a command runs without -x' 'ran' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" echo ran 2>/dev/null)"
+has 'a flag after the command belongs to the command' '-n host' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" sh -c 'printf "%s\n" "$*"' _ -n host 2>/dev/null)"
+has 'a leading -- introduces the command' 'hi' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" -- echo hi 2>/dev/null)"
+has 'a later -- reaches the command' 'a -- b' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" echo a -- b 2>/dev/null)"
+corral_err "$PROJECT" --bogus true
+isnt 'an unknown option before the command fails' '0' "$PSTATUS"
+has  'the failure names the option' '--bogus' "$ERR_OUT"
+corral_err "$PROJECT" -x true
+isnt '-x is gone' '0' "$PSTATUS"
+corral_err "$PROJECT" --dry-run
+is  'no command starts the login shell' 'bash -l' "${ERR_OUT##*-- }"
+corral_err "$PROJECT" --dry-run true
+is  'a command replaces the login shell' 'bash -lc true' "${ERR_OUT##*-- }"
 
 
 section 'networking'

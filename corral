@@ -364,7 +364,8 @@ def build_command(config, args):
     if network == "none":
         command += ["--unshare-net"]
 
-    command += ["--", "bash", "-lc", shlex.join(args.exec)] if args.exec else ["--", "bash", "-l"]
+    command += (["--", "bash", "-lc", shlex.join(args.command)] if args.command
+                else ["--", "bash", "-l"])
 
     if network == "private":
         # Without --no-map-gw pasta maps the host onto the gateway address,
@@ -403,6 +404,9 @@ def load_config():
 def main():
     parser = argparse.ArgumentParser(
         prog="corral",
+        # Spelled out because argparse renders a trailing REMAINDER as a bare
+        # '...' on a line of its own, which names nothing.
+        usage="corral [OPTION ...] [COMMAND [ARG ...]]",
         description="Run a shell with the current directory writable and the rest of "
                     "the host read only.",
         epilog=f"Settings live in '{CONFIG_PATH}' and are asked for when missing.",
@@ -418,9 +422,16 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="allow the home directory or '/' as the project")
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
-    parser.add_argument("-x", "--exec", nargs=argparse.REMAINDER, metavar="COMMAND",
-                        help="run a command instead of the shell; must come last")
+    parser.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND",
+                        help="run this instead of the login shell; every argument "
+                             "after it belongs to it")
     args = parser.parse_args()
+
+    # REMAINDER hands the separator over with the rest, so '--' would arrive as
+    # the program to run. Only the first one is corral's; a later one is the
+    # command's own.
+    if args.command[:1] == ["--"]:
+        del args.command[0]
 
     if os.environ.get("CORRAL"):
         # Nesting mostly works, and what it produces is never what was meant:

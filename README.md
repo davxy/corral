@@ -18,7 +18,7 @@ corral -e RUST_LOG=1      # set a variable inside for this run
 corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
 corral --dry-run          # print the bwrap command and exit
-corral -x claude          # run a tool directly instead of the shell
+corral claude             # run a tool directly instead of the shell
 corral --help
 ```
 
@@ -231,7 +231,7 @@ wrote, and carries on. The host directory never changes, and the writes are
 gone at the next run.
 
 ```
-corral -m ./vendor/sdk::tmp -x ./configure
+corral -m ./vendor/sdk::tmp ./configure
 corral -m /data/fixtures:/data:tmp
 ```
 
@@ -246,7 +246,7 @@ Three limits come with it, and none of them is corral's own:
   The sandbox maps one user id, so a copy of a root-owned file has no owner to
   keep and the write fails with `Permission denied`. An overlay over a
   root-owned tree takes new entries at its top level and nothing deeper.
-  `corral -m /usr::tmp -x make install` does not work.
+  `corral -m /usr::tmp make install` does not work.
 - The source must hold no mount point. overlayfs rejects such a lower layer
   with `Invalid argument` from deep inside bwrap, so corral reads
   `/proc/self/mountinfo` first and names the mount point instead. Which paths
@@ -291,7 +291,8 @@ the alternate screen, which terminals keep no scrollback for.
 
 The flag is per run by design. For a variable you always want, export it from
 the sandbox home's `.bashrc`, above the guard that returns early for
-non-interactive shells, so that `corral -x` picks it up too.
+non-interactive shells, so that a command run without the prompt picks it up
+too.
 
 ## Knowing you are inside
 
@@ -364,20 +365,28 @@ traffic leaves.
 
 ## Running a tool directly
 
-`-x`/`--exec` replaces the interactive shell with a command:
+Give corral a command and it replaces the interactive shell:
 
 ```
-corral -x claude
-corral -x cargo test
-corral -u throwaway -x opencode
+corral claude
+corral cargo test
+corral -u throwaway opencode
 ```
 
-Everything after `-x` belongs to the command, so its own flags need no
-escaping and `-x` has to come last:
+corral's own options come first. The command is everything from the first
+argument that is not one of them, so its flags need no escaping:
 
 ```
-corral -x claude --resume     # --resume goes to claude
-corral --resume -x claude     # error: corral has no --resume
+corral claude --resume     # --resume goes to claude
+corral --resume claude     # error: corral has no --resume
+```
+
+A command that starts with a dash needs `--` in front of it. That first `--`
+is corral's; a second one belongs to the command:
+
+```
+corral -- ./-weird-name
+corral cargo test -- --nocapture
 ```
 
 The command runs through a login shell, so it sees the same `PATH` and profile
@@ -469,7 +478,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 101 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 110 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, and that a project under `/home` survives the
 tmpfs that empties it.
@@ -477,7 +486,7 @@ tmpfs that empties it.
 ```
 $ ./tests/corral-test
 ...
-97 passed, 0 failed, 4 skipped
+106 passed, 0 failed, 4 skipped
 ```
 
 It needs no configuration: it writes its own `config.json` under a temporary
