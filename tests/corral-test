@@ -516,5 +516,82 @@ else
 fi
 
 
+section 'the project file'
+
+# A '.corral.json' in the project directory stands for the flags that everyone
+# who clones the repository gets. It is read from the working directory only,
+# a flag beats it, and it cannot lift the guard on $HOME and '/'. The one line
+# it prints is what makes a mount from a file nobody read visible.
+FPROJECT="$TMP/filed"
+mkdir -p "$FPROJECT/sub" "$TMP/fixtures"
+echo fixture > "$TMP/fixtures/file"
+project_file() { printf '%s\n' "$1" > "$FPROJECT/.corral.json"; }
+
+project_file '{"network": "host", "user": "other", "mounts": ["../sibling"], "env": ["RUST_LOG=debug"]}'
+is   'a mount from the file applies, relative to the project' 'shared' \
+     "$(probe "$FPROJECT" 'cat '"$TMP"'/sibling/file')"
+is   'a variable from the file applies' 'debug' "$(probe "$FPROJECT" 'echo "${RUST_LOG:-unset}"')"
+isnt 'the network mode from the file applies' 'lo' "$(probe "$FPROJECT" "python3 -c '$links'")"
+is   'the user from the file applies' 'other' "$(probe "$FPROJECT" 'echo "$CORRAL_USER"')"
+corral_err "$FPROJECT" --dry-run
+has   'one line names the file and what it added' \
+      '.corral.json: -n host -u other -m ../sibling -e RUST_LOG=debug' "$ERR_OUT"
+hasnt 'that line is not on stdout' '.corral.json' \
+      "$(cd "$FPROJECT" && "$CORRAL_BIN" --dry-run 2>/dev/null)"
+
+is   'a network flag beats the file' 'lo' "$(probe "$FPROJECT" "python3 -c '$links'" -n none)"
+is   'a user flag beats the file' 'corral' "$(probe "$FPROJECT" 'echo "$CORRAL_USER"' -u corral)"
+is   'a variable flag beats the file' 'trace' \
+     "$(probe "$FPROJECT" 'echo "$RUST_LOG"' -e RUST_LOG=trace)"
+is   'a mount flag adds to the file' 'shared fixture' \
+     "$(probe "$FPROJECT" 'echo $(cat '"$TMP"'/sibling/file '"$TMP"'/fixtures/file)' \
+        -m "$TMP/fixtures")"
+is   'a mount flag on the same target beats the file' 'wrote' \
+     "$(probe "$FPROJECT" 'touch '"$TMP"'/sibling/from-flag && echo wrote' -m "$TMP/sibling::rw")"
+corral_err "$FPROJECT" -n none -u corral -e RUST_LOG=trace --dry-run
+has   'the line omits what a flag replaced' '.corral.json: -m ../sibling' "$ERR_OUT"
+hasnt 'including the variable' 'RUST_LOG=debug' "$ERR_OUT"
+
+is 'a file in a parent directory is not read' 'unset' \
+   "$(probe "$FPROJECT/sub" 'echo "${RUST_LOG:-unset}"')"
+
+project_file '{"env": ["CORRAL_TEST_TOKEN"]}'
+is 'a bare name in the file forwards the host value' 'from-host' \
+   "$(CORRAL_TEST_TOKEN=from-host probe "$FPROJECT" 'echo "${CORRAL_TEST_TOKEN:-unset}"')"
+
+project_file '{"mounts": ["~"]}'
+corral_err "$FPROJECT" --dry-run
+isnt 'the home directory is refused as a mount source from the file' '0' "$PSTATUS"
+corral_err "$FPROJECT" --force --dry-run
+isnt '--force does not lift that refusal' '0' "$PSTATUS"
+has  'and the refusal names the file' '.corral.json' "$ERR_OUT"
+
+project_file '{"force": true}'
+corral_err "$FPROJECT" --dry-run
+isnt 'a force key is refused' '0' "$PSTATUS"
+has  'the refusal names it' "'force'" "$ERR_OUT"
+project_file '{"mount": ["../sibling"]}'
+corral_err "$FPROJECT" --dry-run
+isnt 'an unknown key is refused' '0' "$PSTATUS"
+has  'the refusal names the key' "'mount'" "$ERR_OUT"
+project_file '{"mounts": "../sibling"}'
+corral_err "$FPROJECT" --dry-run
+isnt 'a value of the wrong type is refused' '0' "$PSTATUS"
+project_file '{"network": "bogus"}'
+corral_err "$FPROJECT" --dry-run
+isnt 'an unknown network mode in the file is refused' '0' "$PSTATUS"
+has  'the refusal names the file' '.corral.json' "$ERR_OUT"
+project_file '["../sibling"]'
+corral_err "$FPROJECT" --dry-run
+isnt 'a file that is not an object is refused' '0' "$PSTATUS"
+project_file '{"mounts": ['
+corral_err "$FPROJECT" --dry-run
+isnt 'malformed JSON is refused' '0' "$PSTATUS"
+has  'that refusal names the file too' '.corral.json' "$ERR_OUT"
+
+project_file '{}'
+is 'an empty file prints no line' '' "$(cd "$FPROJECT" && "$CORRAL_BIN" --dry-run 2>&1 >/dev/null)"
+
+
 printf '\n%d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

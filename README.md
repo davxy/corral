@@ -56,6 +56,51 @@ about that one alone. Delete the file to be asked everything again.
 
 `homes` defaults to `~/.local/share/corral/homes`.
 
+Settings that belong to one project go in its own
+[`.corral.json`](#the-project-file) instead.
+
+## The project file
+
+A `.corral.json` in the project directory holds the flags that the project
+always needs, so that nobody retypes them and everyone who clones the
+repository gets the same sandbox:
+
+```json
+{
+  "network": "host",
+  "user": "myproject",
+  "mounts": ["../core", "/data/fixtures:/data:ro"],
+  "env": ["RUST_LOG=debug"]
+}
+```
+
+The four keys stand for `-n`, `-u`, `-m` and `-e`, with the same syntax and
+the same rules. A relative mount path resolves against the project directory.
+A bare name under `env` forwards the host's value, as `-e NAME` does.
+
+A flag always wins. `-n` and `-u` replace the file's value. Mounts and
+variables add up, with the flag's after the file's, so a flag that names the
+same target or the same variable covers the file's entry.
+
+Only the working directory is looked at. A file in a parent directory is not
+read, because walking upward is how a file you have never read ends up
+applying to you. For the same reason the file cannot lift the guard on `$HOME`
+and `/`: `--force` does not extend to its mounts, and a `force` key is
+refused.
+
+Before the sandbox starts, one line on stderr names the file and lists what it
+added, as the flags it stands for, minus the entries a flag replaced:
+
+```
+$ corral
+.corral.json: -n host -u myproject -m ../core -m /data/fixtures:/data:ro -e RUST_LOG=debug
+```
+
+That line is the whole safeguard for a repository you did not write. The guard
+stops `$HOME` and `/` and nothing else, so a file that mounts
+`/run/user/1000/gnupg/S.gpg-agent.ssh` is accepted, printed, and mounted. Read
+the line, or read the file first.
+
 ## Sandbox users
 
 `--user NAME` binds `<homes>/NAME` at `/home/NAME` and runs under that name.
@@ -207,8 +252,11 @@ unless `:rw` is appended, or `:tmp` for
 
 The source has to exist, and the refusal of `$HOME` and `/` applies to mount
 sources too, with `--force` overriding it as usual. There is deliberately no
-config key for this. A mount that persisted invisibly across sessions is a
-hole you would forget about, while a flag you retype keeps it intentional.
+key for this in the global config. A mount that persisted invisibly across
+sessions is a hole you would forget about, while a flag you retype keeps it
+intentional. A mount that one project always needs goes in that project's
+[`.corral.json`](#the-project-file), which is committed and shows in every
+diff.
 
 When the guest path does not exist on the read-only rootfs, `corral` replaces
 its parent with a tmpfs so the mount point can be created, and binds the
@@ -291,8 +339,9 @@ under [Knowing you are inside](#knowing-you-are-inside). The third is
 the alternate screen, which terminals keep no scrollback for.
 `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` restores the stock rendering.
 
-The flag is per run by design. For a variable you always want, export it from
-the sandbox home's `.bashrc`, above the guard that returns early for
+The flag is per run by design. For a variable that one project always needs,
+use its [`.corral.json`](#the-project-file). For one you always want, export
+it from the sandbox home's `.bashrc`, above the guard that returns early for
 non-interactive shells, so that a command run without the prompt picks it up
 too.
 
@@ -365,7 +414,7 @@ on that loopback is reachable too.
 answer, because the host resolver is reachable over a unix socket, but no
 traffic leaves.
 
-`-n`/`--net` overrides the config for a single run.
+`-n`/`--net` overrides the config and the project file for a single run.
 
 ## Running a tool directly
 
@@ -482,15 +531,15 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 113 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 142 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
-agent socket is out of reach, and that a project under `/home` survives the
-tmpfs that empties it.
+agent socket is out of reach, that a project under `/home` survives the tmpfs
+that empties it, and that a `.corral.json` adds what it says and no more.
 
 ```
 $ ./tests/corral-test
 ...
-108 passed, 0 failed, 5 skipped
+137 passed, 0 failed, 5 skipped
 ```
 
 It needs no configuration: it writes its own `config.json` under a temporary

@@ -14,6 +14,14 @@ CWD = Path.cwd().resolve()
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.json"
 
+# The flags a project ships with, read from the working directory only. A file
+# found by walking upward is one the caller may never have read.
+PROJECT_FILE = ".corral.json"
+PROJECT_KEYS = ("network", "user", "mounts", "env")
+
+FORCE_REMEDY = "Pass --force to override."
+PROJECT_REMEDY = f"A '{PROJECT_FILE}' cannot ask for it. Pass the mount as a flag, with --force."
+
 DEFAULT_USER = "corral"
 HOSTNAME = "corral"
 
@@ -78,7 +86,7 @@ def ask_config_choice(config, key, prompt, modified, choices, default):
         print(f"Expected one of: {listed}")
 
 
-def parse_mount(spec, force):
+def parse_mount(spec, force, remedy=FORCE_REMEDY):
     parts = spec.split(":")
     if not 1 <= len(parts) <= 3:
         raise SystemExit(f"invalid mount '{spec}': expected HOST[:GUEST[:ro|rw|tmp]]")
@@ -94,7 +102,7 @@ def parse_mount(spec, force):
     source = Path(host).expanduser().resolve()
     if not source.exists():
         raise SystemExit(f"mount source '{source}' does not exist")
-    guard_path(source, force, f"refusing to mount '{source}'")
+    guard_path(source, force, f"refusing to mount '{source}'", remedy)
     # GUEST mirrors the host path by default, so a relative reference such as a
     # cargo path dependency on '../core' still resolves inside.
     return source, Path(guest) if guest else source, mode
@@ -113,12 +121,12 @@ def parse_env(spec):
     return name, os.environ[name]
 
 
-def guard_path(path, force, message):
+def guard_path(path, force, message, remedy=FORCE_REMEDY):
     if force:
         return
     if path == Path("/") or path == Path.home().resolve():
         raise SystemExit(f"{message}: it is the home directory or the filesystem root.\n"
-                         f"Everything below it would come along. Pass --force to override.")
+                         f"Everything below it would come along. {remedy}")
 
 
 def guard_overlays(mounts):
@@ -226,12 +234,12 @@ def scaffold(target, tmpfs_roots):
     return args
 
 
-def build_command(config, args):
-    username = args.user or config.get("default_user") or DEFAULT_USER
+def build_command(config, project, args):
+    username = args.user or project.get("user") or config.get("default_user") or DEFAULT_USER
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
 
-    network = args.net or config.get("network") or DEFAULT_NETWORK
+    network = args.net or project.get("network") or config.get("network") or DEFAULT_NETWORK
     if network not in NETWORKS:
         raise SystemExit(f"invalid network '{network}': expected one of {', '.join(NETWORKS)}")
     if network == "private" and not shutil.which("pasta"):
@@ -239,10 +247,11 @@ def build_command(config, args):
                          "Install it, or pass '-n host' to share the host's network.")
 
     guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
-    mounts = [parse_mount(spec, args.force) for spec in args.mount]
+    mounts = ([parse_mount(spec, False, PROJECT_REMEDY) for spec in project.get("mounts", [])]
+              + [parse_mount(spec, args.force) for spec in args.mount])
     guard_overlays(mounts)
     guard_bwrap_overlay(mounts)
-    variables = [parse_env(spec) for spec in args.env]
+    variables = [parse_env(spec) for spec in project_env(project, args) + args.env]
 
     homes = Path(config["homes"]).expanduser()
     home = homes / username
@@ -392,15 +401,70 @@ def build_command(config, args):
     return command
 
 
+def read_object(path, label):
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"malformed {label}: {error}")
+    if not isinstance(data, dict):
+        raise SystemExit(f"malformed {label}: expected an object")
+    return data
+
+
+def read_project():
+    path = CWD / PROJECT_FILE
+    if not path.is_file():
+        return {}
+    project = read_object(path, f"'{PROJECT_FILE}'")
+    if "force" in project:
+        raise SystemExit(f"refusing 'force' from '{PROJECT_FILE}': only the command line can "
+                         f"lift the guard on the home directory and '/'.")
+    for key, value in project.items():
+        if key not in PROJECT_KEYS:
+            raise SystemExit(f"unknown key '{key}' in '{PROJECT_FILE}': "
+                             f"expected one of {', '.join(PROJECT_KEYS)}")
+        if key in ("mounts", "env"):
+            if not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+                raise SystemExit(f"'{key}' in '{PROJECT_FILE}' must be a list of strings")
+        elif not isinstance(value, str):
+            raise SystemExit(f"'{key}' in '{PROJECT_FILE}' must be a string")
+    if "network" in project and project["network"] not in NETWORKS:
+        raise SystemExit(f"invalid network '{project['network']}' in '{PROJECT_FILE}': "
+                         f"expected one of {', '.join(NETWORKS)}")
+    if "user" in project and not USERNAME_RE.match(project["user"]):
+        raise SystemExit(f"invalid user '{project['user']}' in '{PROJECT_FILE}': "
+                         f"expected {USERNAME_RE.pattern}")
+    return project
+
+
+def project_env(project, args):
+    given = {spec.partition("=")[0] for spec in args.env}
+    return [spec for spec in project.get("env", []) if spec.partition("=")[0] not in given]
+
+
+def project_flags(project, args):
+    """What the file adds, as the flags it stands for.
+
+    A flag replaces the file's network or user, and drops the file's entry for
+    the same variable. Mounts add up: the flag's is emitted after the file's,
+    so it covers the file's when both name one target.
+    """
+    flags = []
+    if "network" in project and not args.net:
+        flags += ["-n", project["network"]]
+    if "user" in project and not args.user:
+        flags += ["-u", project["user"]]
+    for spec in project.get("mounts", []):
+        flags += ["-m", spec]
+    for spec in project_env(project, args):
+        flags += ["-e", spec]
+    return flags
+
+
 def load_config():
     config = {}
     if CONFIG_PATH.exists():
-        try:
-            config = json.loads(CONFIG_PATH.read_text())
-        except json.JSONDecodeError as error:
-            raise SystemExit(f"malformed config '{CONFIG_PATH}': {error}")
-        if not isinstance(config, dict):
-            raise SystemExit(f"malformed config '{CONFIG_PATH}': expected an object")
+        config = read_object(CONFIG_PATH, f"config '{CONFIG_PATH}'")
 
     modified = []
     ask_config(config, "homes", "Sandboxed homes root", modified,
@@ -426,7 +490,8 @@ def main():
         usage="corral [OPTION ...] [COMMAND [ARG ...]]",
         description="Run a shell with the current directory writable and the rest of "
                     "the host read only.",
-        epilog=f"Settings live in '{CONFIG_PATH}' and are asked for when missing.",
+        epilog=f"Settings live in '{CONFIG_PATH}' and are asked for when missing. "
+               f"A '{PROJECT_FILE}' in the working directory adds flags for that project.",
     )
     parser.add_argument("-u", "--user", help="sandbox user to run as")
     parser.add_argument("-m", "--mount", action="append", default=[],
@@ -461,7 +526,11 @@ def main():
     if not shutil.which("bwrap"):
         raise SystemExit("bwrap was not found on PATH; is bubblewrap installed?")
 
-    command = build_command(load_config(), args)
+    project = read_project()
+    command = build_command(load_config(), project, args)
+    flags = project_flags(project, args)
+    if flags:
+        print(f"{PROJECT_FILE}: {shlex.join(flags)}", file=sys.stderr)
     if args.dry_run:
         print(shlex.join(command))
         return
