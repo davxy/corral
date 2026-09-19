@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+CWD = Path.cwd().resolve()
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.json"
+
+DEFAULT_USER = "corral"
+HOSTNAME = "corral"
+
+# Where the shared toolchain is mounted in the guest. The path is fixed
+# because rustup proxies, uv shims and Python entry points hardcode absolute
+# paths into what they install, so the directory only works when it comes
+# back at the same path every run.
+TOOLS_GUEST = "/opt/corral"
+
+# 'private' gives the sandbox its own network namespace with a userspace stack,
+# so the internet works but the host's own loopback services do not answer.
+NETWORKS = ("private", "host", "none")
+DEFAULT_NETWORK = "private"
+
+# The username ends up in a generated passwd entry and as a directory name.
+USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+# Environment variable names. A typo has to be caught here, because bwrap will
+# happily set a name that no shell can read back.
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Session sockets live here. A read-only bind does not stop connect(), so
+# leaving the host's runtime directory in place would hand the sandbox the
+# real ssh and gpg agents.
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+
+# The first two name sockets that are deliberately out of reach. The rest
+# would send agent config and state back to the caller's own home, which is
+# the exact split the sandbox users exist to keep.
+DROPPED_ENV = (
+    "SSH_AUTH_SOCK",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+)
+
+
+def ask_confirmation(prompt):
+    return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def ask_config(config, key, prompt, modified, default):
+    if key in config:
+        return
+    suffix = f" [{default}]" if default else ""
+    config[key] = input(f"{prompt}{suffix}: ").strip() or default
+    modified.append(key)
+
+
+def ask_config_choice(config, key, prompt, modified, choices, default):
+    if key in config:
+        return
+    listed = "/".join(choices)
+    while True:
+        answer = input(f"{prompt} ({listed}) [{default}]: ").strip() or default
+        if answer in choices:
+            config[key] = answer
+            modified.append(key)
+            return
+        print(f"Expected one of: {listed}")
+
+
+def parse_mount(spec, force):
+    parts = spec.split(":")
+    if not 1 <= len(parts) <= 3:
+        raise SystemExit(f"invalid mount '{spec}': expected HOST[:GUEST[:ro|rw|tmp]]")
+    host = parts[0]
+    guest = parts[1] if len(parts) > 1 else ""
+    mode = parts[2] if len(parts) > 2 else "ro"
+    if mode not in ("ro", "rw", "tmp"):
+        raise SystemExit(f"invalid mount mode '{mode}' in '{spec}': "
+                         f"expected 'ro', 'rw' or 'tmp'")
+    if guest and not guest.startswith("/"):
+        raise SystemExit(f"invalid mount target '{guest}' in '{spec}': expected an absolute path")
+
+    source = Path(host).expanduser().resolve()
+    if not source.exists():
+        raise SystemExit(f"mount source '{source}' does not exist")
+    guard_path(source, force, f"refusing to mount '{source}'")
+    # GUEST mirrors the host path by default, so a relative reference such as a
+    # cargo path dependency on '../core' still resolves inside.
+    return source, Path(guest) if guest else source, mode
+
+
+def parse_env(spec):
+    name, separator, value = spec.partition("=")
+    if not ENV_NAME_RE.match(name):
+        raise SystemExit(f"invalid variable name '{name}'")
+    if separator:
+        return name, value
+    if name not in os.environ:
+        # An empty variable and an unforwarded one look identical inside, so a
+        # missing name has to be an error rather than a silent no-op.
+        raise SystemExit(f"'{name}' is not set on the host, so there is nothing to forward")
+    return name, os.environ[name]
+
+
+def guard_path(path, force, message):
+    if force:
+        return
+    if path == Path("/") or path == Path.home().resolve():
+        raise SystemExit(f"{message}: it is the home directory or the filesystem root.\n"
+                         f"Everything below it would come along. Pass --force to override.")
+
+
+def guard_overlays(mounts):
+    """Refuse the overlay sources that overlayfs cannot take.
+
+    Neither case reports itself. A source inside another source is left
+    undefined by overlayfs, and the kernel takes it without a word. A source
+    with a mount point inside it comes back from bwrap as 'Invalid argument'
+    on a mount the caller never wrote.
+    """
+    sources = [source for source, _, mode in mounts if mode == "tmp"]
+    if not sources:
+        return
+    mounted = [Path(line.split()[4])
+               for line in Path("/proc/self/mountinfo").read_text().splitlines()]
+    for source in sources:
+        for other in sources:
+            if source in other.parents:
+                raise SystemExit(f"refusing to overlay '{other}' inside '{source}': "
+                                 f"overlayfs forbids one source under another")
+        for point in mounted:
+            if source in point.parents:
+                raise SystemExit(f"cannot overlay '{source}': '{point}' is mounted inside it.\n"
+                                 f"overlayfs refuses a lower layer that holds a mount point.")
+
+
+def generated_etc(directory, username):
+    """The /etc files that have to describe the sandbox rather than the host.
+
+    The sandbox runs as uid 0, because creating a network namespace needs
+    CAP_NET_ADMIN, which an unprivileged user only gets by becoming root
+    inside a new user namespace. That 0 maps back to the caller's own uid on
+    the host, so it carries no host privilege at all.
+
+    passwd matters because some tools read $HOME while others call getpwuid().
+    Both have to give the sandbox home, or agent state lands in a directory
+    that is not mounted.
+    """
+    def replaced(source, added):
+        lines = [line for line in Path(source).read_text().splitlines()
+                 if line.split(":")[2:3] != ["0"]]
+        return "\n".join(lines + [added]) + "\n"
+
+    files = {
+        "/etc/passwd": replaced("/etc/passwd", f"{username}:x:0:0::/home/{username}:/bin/bash"),
+        "/etc/group": replaced("/etc/group", f"{username}:x:0:"),
+    }
+    written = {}
+    for guest, text in files.items():
+        path = directory / Path(guest).name
+        path.write_text(text)
+        written[guest] = path
+    return written
+
+
+def seed_home(home):
+    """Give a fresh sandbox home the shell files the distribution ships.
+
+    Without them the prompt has no colours, no history and no completion, and
+    there is nowhere obvious to put a variable that every session needs.
+    """
+    skeleton = Path("/etc/skel")
+    if not skeleton.is_dir():
+        return
+    for entry in skeleton.iterdir():
+        target = home / entry.name
+        if entry.is_file() and not target.exists():
+            shutil.copy(entry, target)
+
+
+def scaffold(target, tmpfs_roots):
+    """Arguments that let bwrap create the mount point for TARGET.
+
+    The rootfs arrives read only, so a bind whose target does not already
+    exist fails outright. Replacing the parent with a tmpfs makes the mkdir
+    possible, and the parent's real entries are bound back so that nothing
+    which was there disappears.
+
+    What a re-bound entry cannot bring back is a mount, so these have to be
+    emitted before the sandbox's own. '-m src:/data' replaces '/' to create
+    '/data'; run after '--tmpfs /home' that would bury it and put the host's
+    real home back in its place, read only but entirely readable.
+    """
+    if any(target == root or root in target.parents for root in tmpfs_roots):
+        return []
+    if target.exists():
+        return []
+    parent = target.parent
+    if not parent.is_dir():
+        raise SystemExit(f"cannot mount at '{target}': '{parent}' does not exist on the host")
+    tmpfs_roots.append(parent)
+    args = ["--tmpfs", str(parent)]
+    for child in sorted(parent.iterdir()):
+        args += ["--ro-bind", str(child), str(child)]
+    return args
+
+
+def build_command(config, args):
+    username = args.user or config.get("default_user") or DEFAULT_USER
+    if not USERNAME_RE.match(username):
+        raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
+
+    network = args.net or config.get("network") or DEFAULT_NETWORK
+    if network not in NETWORKS:
+        raise SystemExit(f"invalid network '{network}': expected one of {', '.join(NETWORKS)}")
+    if network == "private" and not shutil.which("pasta"):
+        raise SystemExit("network 'private' needs 'pasta', from the 'passt' package.\n"
+                         "Install it, or pass '-n host' to share the host's network.")
+
+    guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
+    mounts = [parse_mount(spec, args.force) for spec in args.mount]
+    guard_overlays(mounts)
+    variables = [parse_env(spec) for spec in args.env]
+
+    homes = Path(config["homes"]).expanduser()
+    home = homes / username
+    if not home.is_dir():
+        print(f"There is no '{username}' sandbox yet.")
+        if not ask_confirmation(f"Create '{home}'?"):
+            raise SystemExit("Aborted.")
+        home.mkdir(parents=True)
+    seed_home(home)
+
+    # A leading dot is not a legal username, so this cannot collide with one.
+    generated = homes / ".corral" / username
+    generated.mkdir(parents=True, exist_ok=True)
+    guest_home = Path("/home") / username
+
+    tools = Path(config["tools"]).expanduser() if config.get("tools") else None
+    if tools and not tools.is_dir():
+        print(f"warning: toolchain '{tools}' does not exist; nothing is mounted at "
+              f"{TOOLS_GUEST}", file=sys.stderr)
+        tools = None
+
+    # '/home' is replaced wholesale so that no real home survives, which means
+    # every later bind under it has to come after this one.
+    tmpfs_roots = [Path("/tmp"), Path("/var/tmp"), Path("/home")]
+    if RUNTIME_DIR.is_dir():
+        tmpfs_roots.append(RUNTIME_DIR)
+
+    # Worked out before the sandbox's own mounts and emitted ahead of them,
+    # because the parent a mount point needs is often an ancestor of one of
+    # them; see scaffold. Nothing here is placed under a tmpfs that is about to
+    # be laid down, since bwrap creates a mount point in a tmpfs by itself.
+    scaffolding = []
+    if tools:
+        scaffolding += scaffold(Path(TOOLS_GUEST), tmpfs_roots)
+    for _, target, _ in mounts:
+        scaffolding += scaffold(target, tmpfs_roots)
+
+    command = ["bwrap", "--ro-bind", "/", "/"] + scaffolding + [
+        "--dev", "/dev",
+        "--proc", "/proc",
+        "--tmpfs", "/tmp",
+        "--tmpfs", "/var/tmp",
+        "--tmpfs", "/home",
+    ]
+    if RUNTIME_DIR.is_dir():
+        command += ["--perms", "0700", "--tmpfs", str(RUNTIME_DIR)]
+
+    command += ["--bind", str(home), str(guest_home)]
+
+    if tools:
+        command += ["--ro-bind", str(tools), TOOLS_GUEST]
+    for source, target, mode in mounts:
+        if mode != "tmp":
+            command += ["--bind" if mode == "rw" else "--ro-bind", str(source), str(target)]
+
+    # Last of the binds, because the project usually lives under a directory
+    # that one of the tmpfs mounts above has just emptied.
+    command += ["--bind", str(CWD), str(CWD)]
+
+    # After every bind, because an overlay has to sit on top of whatever holds
+    # its target. An overlay on a directory inside the project needs the
+    # project bound first, or that bind covers it and the writes it was asked
+    # to throw away reach the host instead.
+    for source, target, mode in mounts:
+        if mode == "tmp":
+            command += ["--overlay-src", str(source), "--tmp-overlay", str(target)]
+
+    # After the overlays in turn: '-m /etc::tmp' would otherwise bury these two
+    # and the sandbox would answer getpwuid() with the host's entry for uid 0.
+    for guest, path in generated_etc(generated, username).items():
+        command += ["--ro-bind", str(path), guest]
+
+    # Those tmpfs mounts exist to carry mount points and nothing else, so
+    # nothing should be writing into one. Left writable, a write into the empty
+    # '/home/<you>' standing above the project, or into a directory invented to
+    # hold a '-m' target, succeeds and then disappears at exit: exactly the
+    # quiet loss that a read-only rootfs exists to turn into an error.
+    #
+    # This has to come after every bind, because bwrap applies operations in
+    # order and a bind needs its mount point to be writable at the moment it is
+    # made. '--remount-ro' does not recurse, so the binds underneath stay
+    # writable. '/tmp', '/var/tmp' and the runtime directory are left alone:
+    # those are scratch, and everything expects to write there.
+    scratch = (Path("/tmp"), Path("/var/tmp"), RUNTIME_DIR)
+    for root in tmpfs_roots:
+        if root not in scratch:
+            command += ["--remount-ro", str(root)]
+
+    tool_paths = [f"{TOOLS_GUEST}/.local/bin", f"{TOOLS_GUEST}/.cargo/bin"] if tools else []
+    # The caller's own bin directories are gone with the home, so an entry that
+    # points into it would only slow every lookup down.
+    real_home = str(Path.home().resolve())
+    inherited = [entry for entry in os.environ.get("PATH", "").split(":")
+                 if entry and not entry.startswith(real_home + "/")]
+    path = ":".join([f"{guest_home}/.local/bin", f"{guest_home}/.cargo/bin"]
+                    + tool_paths + inherited)
+
+    command += [
+        "--setenv", "HOME", str(guest_home),
+        "--setenv", "USER", username,
+        "--setenv", "LOGNAME", username,
+        "--setenv", "PATH", path,
+        # The only reliable way to tell from inside that this is a sandbox.
+        # USER and the hostname can both be anything, so a shell prompt, a
+        # .bashrc or a script that must not run on the host needs its own name
+        # to test. It doubles as the guard against nesting; see main().
+        "--setenv", "CORRAL", "1",
+        "--setenv", "CORRAL_USER", username,
+        # claude renders in the alternate screen otherwise, which terminals
+        # keep no scrollback for.
+        "--setenv", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1",
+    ]
+    for name in DROPPED_ENV:
+        command += ["--unsetenv", name]
+    for name, value in variables:
+        command += ["--setenv", name, value]
+
+    command += [
+        # Held to one uid so that the identity does not change with the
+        # network mode; see generated_etc for why that uid is 0.
+        "--unshare-user", "--uid", "0", "--gid", "0",
+        "--unshare-pid",
+        "--unshare-ipc",
+        # Fixed, because the network helper otherwise renames the host and the
+        # prompt would then depend on which network mode was chosen.
+        "--unshare-uts", "--hostname", HOSTNAME,
+        "--die-with-parent",
+        "--chdir", str(CWD),
+    ]
+
+    if network == "none":
+        command += ["--unshare-net"]
+
+    command += ["--", "bash", "-lc", shlex.join(args.exec)] if args.exec else ["--", "bash", "-l"]
+
+    if network == "private":
+        # Without --no-map-gw pasta maps the host onto the gateway address,
+        # which would put every loopback service back within reach.
+        command = ["pasta", "--config-net", "--no-map-gw", "--quiet", "--"] + command
+
+    return command
+
+
+def load_config():
+    config = {}
+    if CONFIG_PATH.exists():
+        try:
+            config = json.loads(CONFIG_PATH.read_text())
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"malformed config '{CONFIG_PATH}': {error}")
+        if not isinstance(config, dict):
+            raise SystemExit(f"malformed config '{CONFIG_PATH}': expected an object")
+
+    modified = []
+    ask_config(config, "homes", "Sandboxed homes root", modified,
+               str(Path.home() / ".local/share/corral/homes"))
+    ask_config(config, "tools", "Shared toolchain directory, empty for none", modified, "")
+    ask_config(config, "default_user", "Default sandbox user", modified, DEFAULT_USER)
+    ask_config_choice(config, "network", "Network mode", modified, NETWORKS, DEFAULT_NETWORK)
+
+    if modified:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+        print(f"Config saved to '{CONFIG_PATH}'!")
+
+    Path(config["homes"]).expanduser().mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="corral",
+        description="Run a shell with the current directory writable and the rest of "
+                    "the host read only.",
+        epilog=f"Settings live in '{CONFIG_PATH}' and are asked for when missing.",
+    )
+    parser.add_argument("-u", "--user", help="sandbox user to run as")
+    parser.add_argument("-m", "--mount", action="append", default=[],
+                        metavar="HOST[:GUEST[:ro|rw|tmp]]",
+                        help="bind another host path, read only unless ':rw', or ':tmp' for "
+                             "writes that the host never sees")
+    parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
+                        help="set a variable, or forward the host's value")
+    parser.add_argument("-n", "--net", choices=NETWORKS, help="network mode for this run")
+    parser.add_argument("--force", action="store_true",
+                        help="allow the home directory or '/' as the project")
+    parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
+    parser.add_argument("-x", "--exec", nargs=argparse.REMAINDER, metavar="COMMAND",
+                        help="run a command instead of the shell; must come last")
+    args = parser.parse_args()
+
+    if os.environ.get("CORRAL"):
+        # Nesting mostly works, and what it produces is never what was meant:
+        # the inner sandbox is built from this one's read-only rootfs and
+        # emptied /home, so 'the rest of the host' is already gone.
+        inner = os.environ.get("CORRAL_USER") or "?"
+        raise SystemExit(f"already inside the '{inner}' sandbox.\n"
+                         f"Exit first, or run 'env -u CORRAL corral' to nest deliberately.")
+
+    if not shutil.which("bwrap"):
+        raise SystemExit("bwrap was not found on PATH; is bubblewrap installed?")
+
+    command = build_command(load_config(), args)
+    if args.dry_run:
+        print(shlex.join(command))
+        return
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (EOFError, KeyboardInterrupt):
+        raise SystemExit("\nAborted.")

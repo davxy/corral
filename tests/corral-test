@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+#
+# corral-test - assert the properties the README claims.
+#
+# Needs bwrap on PATH. The 'private' network assertions need pasta as well and
+# report 'skip' without it, which is what happens inside a sandbox that has no
+# /dev/net/tun. Everything is written under two temporary directories, one in
+# $TMPDIR and one under $HOME, because 'a project below /home still works' is
+# itself one of the properties. Both are removed on exit, and so is the one
+# socket the agent-reachability test has to place in $XDG_RUNTIME_DIR.
+
+set -uo pipefail
+
+CORRAL_BIN=$(cd "$(dirname "$0")/.." && pwd)/corral
+[ -x "$CORRAL_BIN" ] || { echo "no executable corral at $CORRAL_BIN" >&2; exit 2; }
+command -v bwrap >/dev/null || { echo "bwrap is not on PATH" >&2; exit 2; }
+
+HOST_HOME=$(cd "$HOME" && pwd -P)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/corral-test-XXXXXX")
+HOMETMP=$(mktemp -d "$HOST_HOME/.corral-test-XXXXXX")
+SOCK=
+SOCKPID=
+
+cleanup() {
+    [ -n "$SOCKPID" ] && kill "$SOCKPID" 2>/dev/null
+    [ -n "$SOCK" ] && rm -f "$SOCK"
+    rm -rf "$TMP" "$HOMETMP"
+}
+trap cleanup EXIT
+
+# 'none' as the configured mode keeps the bulk of the suite independent of
+# pasta; the modes are compared against each other further down with -n.
+export XDG_CONFIG_HOME="$TMP/config"
+mkdir -p "$XDG_CONFIG_HOME/corral" "$TMP/homes/corral" "$TMP/homes/other"
+cat > "$XDG_CONFIG_HOME/corral/config.json" <<EOF
+{
+  "homes": "$TMP/homes",
+  "tools": "",
+  "default_user": "corral",
+  "network": "none"
+}
+EOF
+
+PROJECT="$TMP/project"
+mkdir -p "$PROJECT"
+
+# The guard has to be off for the suite itself to run, since a test run from
+# inside a sandbox is exactly how this gets used.
+unset CORRAL CORRAL_USER
+
+passed=0; failed=0; skipped=0
+
+ok()   { passed=$((passed + 1)); printf '  ok   %s\n' "$1"; }
+bad()  { failed=$((failed + 1)); printf '  FAIL %s\n' "$1"
+         [ $# -gt 1 ] && printf '       %s\n' "$2"; return 0; }
+skip() { skipped=$((skipped + 1)); printf '  skip %s (%s)\n' "$1" "$2"; }
+
+section() { printf '\n%s\n' "$1"; }
+
+is()     { [ "$2" = "$3" ] && ok "$1" || bad "$1" "expected '$2', got '$3'"; }
+isnt()   { [ "$2" != "$3" ] && ok "$1" || bad "$1" "expected anything but '$2'"; }
+has()    { case "$3" in *"$2"*) ok "$1";; *) bad "$1" "'$2' not in: $3";; esac; }
+hasnt()  { case "$3" in *"$2"*) bad "$1" "'$2' found in: $3";; *) ok "$1";; esac; }
+
+# probe DIR CODE [corral args...] - run CODE inside the sandbox, print what it
+# wrote. Markers fence off whatever the login shell's profile decides to say.
+PSTATUS=0
+probe() {
+    local dir=$1 code=$2 out
+    shift 2
+    out=$(cd "$dir" && "$CORRAL_BIN" "$@" -x sh -c "echo __B__; { $code ; } 2>&1; echo __E__" 2>&1)
+    printf '%s' "$out" | sed -n '/^__B__$/,/^__E__$/{//!p;}'
+}
+
+# corral_err DIR [args...] - run a call whose exit status is the point, leaving
+# it in PSTATUS and its output in ERR_OUT. Not a command substitution, because
+# that would set PSTATUS in a subshell and leave the caller reading a stale one.
+ERR_OUT=
+corral_err() {
+    local dir=$1
+    shift
+    ERR_OUT=$(cd "$dir" && "$CORRAL_BIN" "$@" 2>&1)
+    PSTATUS=$?
+}
+
+py() { probe "$PROJECT" "python3 -c '$1'" "${@:2}"; }
+
+# has_submount DIR - true when a mount point sits inside DIR. overlayfs refuses
+# such a directory as a lower layer, so the tests that overlay a system
+# directory only mean something on a host where it has none.
+has_submount() { awk -v d="$1/" '$5 ~ "^"d { found = 1 } END { exit !found }' /proc/self/mountinfo; }
+
+
+section 'markers and identity'
+
+is 'CORRAL is set inside' '1' "$(probe "$PROJECT" 'echo "${CORRAL:-unset}"')"
+is 'CORRAL_USER names the sandbox user' 'corral' \
+   "$(probe "$PROJECT" 'echo "${CORRAL_USER:-unset}"')"
+is 'CORRAL_USER follows --user' 'other' \
+   "$(probe "$PROJECT" 'echo "${CORRAL_USER:-unset}"' -u other)"
+is 'HOME is the sandbox home' '/home/corral' "$(probe "$PROJECT" 'echo "$HOME"')"
+is 'USER is the sandbox user' 'corral' "$(probe "$PROJECT" 'echo "$USER"')"
+is 'getpwuid agrees with HOME' '/home/corral' \
+   "$(probe "$PROJECT" 'getent passwd "$(id -u)" | cut -d: -f6')"
+is 'the hostname is fixed' 'corral' "$(probe "$PROJECT" 'cat /proc/sys/kernel/hostname')"
+is 'the sandbox runs as uid 0' '0' "$(probe "$PROJECT" 'id -u')"
+
+out=$(cd "$PROJECT" && CORRAL=1 CORRAL_USER=outer "$CORRAL_BIN" -x true 2>&1); status=$?
+isnt 'nesting is refused' '0' "$status"
+has  'the refusal names the outer sandbox' 'outer' "$out"
+is   'unsetting CORRAL nests deliberately' '1' \
+     "$(cd "$PROJECT" && CORRAL=1 env -u CORRAL "$CORRAL_BIN" \
+        -x sh -c 'echo __B__; echo "$CORRAL"; echo __E__' 2>&1 \
+        | sed -n '/^__B__$/,/^__E__$/{//!p;}')"
+
+
+section 'environment'
+
+is 'the claude screen variable is set' '1' \
+   "$(probe "$PROJECT" 'echo "${CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN:-unset}"')"
+is '-e NAME=VALUE sets a variable' 'debug' \
+   "$(probe "$PROJECT" 'echo "${RUST_LOG:-unset}"' -e RUST_LOG=debug)"
+is '-e NAME forwards the host value' 'from-host' \
+   "$(CORRAL_TEST_TOKEN=from-host probe "$PROJECT" 'echo "${CORRAL_TEST_TOKEN:-unset}"' \
+      -e CORRAL_TEST_TOKEN)"
+corral_err "$PROJECT" -e CORRAL_TEST_ABSENT -x true
+isnt 'forwarding an unset variable fails' '0' "$PSTATUS"
+has  'the failure says the host does not have it' 'not set on the host' "$ERR_OUT"
+is 'SSH_AUTH_SOCK is dropped' 'unset' \
+   "$(SSH_AUTH_SOCK=/host/agent probe "$PROJECT" 'echo "${SSH_AUTH_SOCK:-unset}"')"
+is 'DBUS_SESSION_BUS_ADDRESS is dropped' 'unset' \
+   "$(DBUS_SESSION_BUS_ADDRESS=unix:path=/host/bus \
+      probe "$PROJECT" 'echo "${DBUS_SESSION_BUS_ADDRESS:-unset}"')"
+is 'XDG_CONFIG_HOME is dropped' 'unset' \
+   "$(probe "$PROJECT" 'echo "${XDG_CONFIG_HOME:-unset}"')"
+path=$(probe "$PROJECT" 'echo "$PATH"' -u other)
+has   'PATH leads with the sandbox home' '/home/other/.local/bin:/home/other/.cargo/bin' "$path"
+hasnt 'PATH keeps nothing under the real home' "$HOST_HOME/" "$path"
+
+
+section 'what is writable'
+
+probe "$PROJECT" 'echo written > marker' >/dev/null
+is 'the project directory is a real host write' 'written' "$(cat "$PROJECT/marker" 2>&1)"
+has '/usr is read only' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch /usr/local/bin/pwned')"
+has '/etc is read only' 'Read-only file system' "$(probe "$PROJECT" 'touch /etc/pwned')"
+probe "$PROJECT" 'echo kept > "$HOME/state"' >/dev/null
+is 'the sandbox home is a real host write' 'kept' "$(cat "$TMP/homes/corral/state" 2>&1)"
+probe "$PROJECT" 'echo elsewhere > "$HOME/state"' -u other >/dev/null
+is 'a second user writes to a second home' 'elsewhere' "$(cat "$TMP/homes/other/state" 2>&1)"
+is 'the first home is untouched by it' 'kept' "$(cat "$TMP/homes/corral/state" 2>&1)"
+# Probed from the home-side project: binding a project that lives under /tmp
+# has to recreate its own path in the tmpfs, which would show up in this list.
+is '/tmp is empty' '' "$(probe "$HOMETMP" 'ls -A /tmp')"
+is '/tmp is writable' 'discarded' "$(probe "$PROJECT" 'echo discarded > /tmp/x; cat /tmp/x')"
+is '/var/tmp is empty' '' "$(probe "$PROJECT" 'ls -A /var/tmp')"
+
+
+section 'what is hidden'
+
+is 'only the sandbox home is under /home' 'corral' "$(probe "$PROJECT" 'ls -A /home')"
+# The target is next to the project rather than in it, so the only thing that
+# could resolve the link is a mount corral was never asked for.
+echo secret > "$TMP/outside"
+ln -sfn "$TMP/outside" "$PROJECT/escape-link"
+is 'the link target is readable on the host' 'secret' "$(cat "$PROJECT/escape-link")"
+has 'a symlink out of the project does not resolve' 'No such file' \
+    "$(probe "$PROJECT" 'cat escape-link')"
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ]; then
+    is 'the runtime directory is empty' '' "$(probe "$PROJECT" 'ls -A "$XDG_RUNTIME_DIR"')"
+    SOCK="$XDG_RUNTIME_DIR/corral-test-$$.sock"
+    python3 -c 'import socket,sys,time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(120)' \
+        "$SOCK" & SOCKPID=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$SOCK" ] && break; sleep 0.2; done
+    if [ -S "$SOCK" ]; then
+        is 'a host agent socket is not visible' 'gone' \
+           "$(probe "$PROJECT" '[ -e "'"$SOCK"'" ] && echo there || echo gone')"
+        is 'a host agent socket cannot be connected to' 'refused' \
+           "$(py 'import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect("'"$SOCK"'"); print("connected")
+except OSError:
+    print("refused")')"
+    else
+        skip 'a host agent socket is out of reach' 'could not bind the test socket'
+        skip 'a host agent socket cannot be connected to' 'could not bind the test socket'
+    fi
+else
+    skip 'the runtime directory is empty' 'XDG_RUNTIME_DIR is not set'
+    skip 'a host agent socket is out of reach' 'XDG_RUNTIME_DIR is not set'
+    skip 'a host agent socket cannot be connected to' 'XDG_RUNTIME_DIR is not set'
+fi
+
+
+section 'a project under /home'
+
+# Run as 'other' throughout, so that the real home and the sandbox home are
+# never the same path. They would be on a host whose own user is called
+# 'corral', and then the assertions below would pass for the wrong reason.
+case "$HOST_HOME" in
+/home/*)
+    probe "$HOMETMP" 'echo survived > marker' -u other >/dev/null
+    is 'a project below the emptied /home is still bound' 'survived' \
+       "$(cat "$HOMETMP/marker" 2>&1)"
+    has 'the tmpfs standing above it refuses writes' 'Read-only file system' \
+        "$(probe "$HOMETMP" 'touch '"$HOST_HOME"'/corral-test-discard' -u other)"
+    is 'and nothing reached the host' 'gone' \
+       "$([ -e "$HOST_HOME/corral-test-discard" ] && echo there || echo gone)"
+    is 'the real home is empty but for the project' "$(basename "$HOMETMP")" \
+       "$(probe "$HOMETMP" 'ls -A '"$HOST_HOME" -u other)"
+    ;;
+*)
+    skip 'a project below the emptied /home is still bound' "\$HOME is $HOST_HOME"
+    skip 'the tmpfs standing above it refuses writes' "\$HOME is $HOST_HOME"
+    skip 'and nothing reached the host' "\$HOME is $HOST_HOME"
+    skip 'the real home is empty but for the project' "\$HOME is $HOST_HOME"
+    ;;
+esac
+
+
+section 'extra mounts'
+
+mkdir -p "$TMP/sibling" "$TMP/data"
+echo shared > "$TMP/sibling/file"
+is 'a read-only mount is readable at the host path' 'shared' \
+   "$(probe "$PROJECT" 'cat '"$TMP"'/sibling/file' -m "$TMP/sibling")"
+has 'a read-only mount rejects writes' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch '"$TMP"'/sibling/new' -m "$TMP/sibling")"
+probe "$PROJECT" 'echo out > /data/written' -m "$TMP/data:/data:rw" >/dev/null
+is 'a rw mount lands on the host' 'out' "$(cat "$TMP/data/written" 2>&1)"
+is 'an explicit guest path is honoured' 'shared' \
+   "$(probe "$PROJECT" 'cat /elsewhere/file' -m "$TMP/sibling:/elsewhere")"
+corral_err "$PROJECT" -m "$TMP/absent" -x true
+isnt 'a missing mount source fails' '0' "$PSTATUS"
+has  'the failure names the source' 'does not exist' "$ERR_OUT"
+corral_err "$PROJECT" -m "$TMP/sibling:relative" -x true
+isnt 'a relative guest path fails' '0' "$PSTATUS"
+has  'the failure asks for an absolute path' 'absolute path' "$ERR_OUT"
+corral_err "$PROJECT" -m "$TMP/sibling:/x:rx" -x true
+isnt 'an unknown mount mode fails' '0' "$PSTATUS"
+has  'the failure lists the modes' "expected 'ro', 'rw' or 'tmp'" "$ERR_OUT"
+
+corral_err "$PROJECT" -m "$TMP/sibling:/srv/deep/ok" --dry-run
+isnt 'a target two directories deep in nothing is refused' '0' "$PSTATUS"
+has  'the refusal names the missing parent' 'does not exist on the host' "$ERR_OUT"
+
+section 'overlay mounts'
+
+# ':tmp' is the state the other two modes cannot express: the write succeeds,
+# the program reads it back, and the host never sees it. A regression to ':ro'
+# fails the write, and one to ':rw' reaches the host, so both show up here.
+mkdir -p "$TMP/lower/sub"
+echo base > "$TMP/lower/sub/file"
+is 'a tmp mount reads the lower layer' 'base' \
+   "$(probe "$PROJECT" 'cat '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp")"
+is 'a tmp mount takes a write and reads it back' 'changed' \
+   "$(probe "$PROJECT" 'echo changed > '"$TMP"'/lower/sub/file; cat '"$TMP"'/lower/sub/file' \
+      -m "$TMP/lower::tmp")"
+is 'the host file still holds the old content' 'base' "$(cat "$TMP/lower/sub/file" 2>&1)"
+probe "$PROJECT" 'touch '"$TMP"'/lower/created' -m "$TMP/lower::tmp" >/dev/null
+is 'a file created in a tmp mount never reaches the host' 'gone' \
+   "$([ -e "$TMP/lower/created" ] && echo there || echo gone)"
+probe "$PROJECT" 'rm '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp" >/dev/null
+is 'a deletion in a tmp mount never reaches the host' 'there' \
+   "$([ -e "$TMP/lower/sub/file" ] && echo there || echo gone)"
+is 'an explicit guest path is honoured for tmp' 'base' \
+   "$(probe "$PROJECT" 'cat /scratch/sub/file' -m "$TMP/lower:/scratch:tmp")"
+
+# An overlay inside the project needs the project bound first. Emitted before
+# that bind, the bind covers the overlay and the write lands on the host, which
+# is the exact opposite of what ':tmp' was asked for.
+mkdir -p "$PROJECT/vendor"
+echo v1 > "$PROJECT/vendor/version"
+is 'a tmp mount inside the project reads back as written' 'v2' \
+   "$(probe "$PROJECT" 'echo v2 > vendor/version; cat vendor/version' -m "$PROJECT/vendor::tmp")"
+is 'and the project directory on the host is untouched' 'v1' \
+   "$(cat "$PROJECT/vendor/version" 2>&1)"
+
+# An overlay covers whatever already stands at its target, so it has to be
+# emitted before the generated passwd. After it, the overlay would bury that
+# passwd and getpwuid() would answer with the host's entry for uid 0.
+if has_submount /etc; then
+    skip 'an overlay on /etc keeps the generated passwd' '/etc holds a mount point here'
+else
+    is 'an overlay on /etc keeps the generated passwd' '/home/corral' \
+       "$(probe "$PROJECT" 'getent passwd "$(id -u)" | cut -d: -f6' -m '/etc::tmp')"
+    isnt 'and the rest of /etc still shows through the overlay' '' \
+         "$(probe "$PROJECT" 'ls -A /etc | head -1' -m '/etc::tmp')"
+fi
+
+# A copied-up file keeps its owner, and the sandbox maps one uid, so an overlay
+# over a tree owned by another user takes new entries at its top level and
+# nothing below. The README says so; this keeps the claim honest.
+if has_submount /usr; then
+    skip 'a tmp mount cannot write into a directory owned by another user' \
+         '/usr holds a mount point here'
+elif [ "$(stat -c %u /usr/lib)" = "$(id -u)" ]; then
+    skip 'a tmp mount cannot write into a directory owned by another user' \
+         '/usr/lib belongs to the caller here'
+else
+    has 'a tmp mount cannot write into a directory owned by another user' 'Permission denied' \
+        "$(probe "$PROJECT" 'touch /usr/lib/corral-test-probe' -m '/usr::tmp')"
+fi
+
+corral_err "$PROJECT" -m "$TMP/lower::tmp" -m "$TMP/lower/sub:/x:tmp" --dry-run
+isnt 'a tmp source inside another tmp source is refused' '0' "$PSTATUS"
+has  'the refusal names overlayfs' 'overlayfs' "$ERR_OUT"
+
+# Every host has mount points under '/', so this one asserts the same guard
+# everywhere. A raw bwrap 'Invalid argument' is what it exists to replace.
+corral_err "$PROJECT" --force -m '/::tmp' --dry-run
+isnt 'a tmp source holding a mount point is refused' '0' "$PSTATUS"
+has  'the refusal names the mount point inside' 'is mounted inside it' "$ERR_OUT"
+
+
+section 'invented mount points'
+
+# A guest path whose parent does not exist inside costs that parent: it is
+# replaced by a tmpfs so the mount point can be made. When the parent is '/'
+# that is the entire rootfs, and every mount the sandbox is built from would go
+# with it, so the replacement is laid down before them rather than over them.
+is 'a target directly under / mounts' 'shared' \
+   "$(probe "$PROJECT" 'cat /newtop/file' -m "$TMP/sibling:/newtop")"
+is 'the /data example from the README works' 'out' \
+   "$(probe "$PROJECT" 'echo out > /data/f; cat /data/f' -m "$TMP/data:/data:rw")"
+is 'and it lands on the host' 'out' "$(cat "$TMP/data/f" 2>&1)"
+is '/home is still emptied underneath it' 'corral' \
+   "$(probe "$PROJECT" 'ls -A /home' -m "$TMP/sibling:/newtop")"
+is 'the real home is still unreadable' 'gone' \
+   "$(probe "$PROJECT" '[ -r '"$HOST_HOME"'/.bashrc ] && echo there || echo gone' \
+      -m "$TMP/sibling:/newtop" -u other)"
+is '/dev still works' 'ok' \
+   "$(probe "$PROJECT" 'echo x > /dev/null && echo ok' -m "$TMP/sibling:/newtop")"
+is '/proc still works' 'corral' \
+   "$(probe "$PROJECT" 'cat /proc/sys/kernel/hostname' -m "$TMP/sibling:/newtop")"
+is 'the invented root is not writable' 'ro' \
+   "$(probe "$PROJECT" 'touch /stray 2>/dev/null && echo rw || echo ro' -m "$TMP/sibling:/newtop")"
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+    case "$XDG_RUNTIME_DIR" in
+    /run/*)
+        is 'a target under /run does not re-expose the host runtime dir' '' \
+           "$(probe "$PROJECT" 'ls -A "$XDG_RUNTIME_DIR"' -m "$TMP/sibling:/run/corral-test")"
+        ;;
+    *)  skip 'a target under /run does not re-expose the host runtime dir' \
+             'the runtime dir is not under /run' ;;
+    esac
+else
+    skip 'a target under /run does not re-expose the host runtime dir' 'XDG_RUNTIME_DIR is not set'
+fi
+
+
+section 'the tmpfs skeleton'
+
+# The tmpfs mounts that only exist to carry mount points are frozen once the
+# binds are in place. Writable, they would accept a write and lose it at exit.
+has '/home itself is read only' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch /home/stray')"
+has 'an invented mount parent is read only' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch /srv/stray' -m "$TMP/sibling:/srv/sib")"
+is 'the read-only mount inside it still reads' 'shared' \
+   "$(probe "$PROJECT" 'cat /srv/sib/file' -m "$TMP/sibling:/srv/sib")"
+is 'a writable mount inside it still writes' 'out' \
+   "$(probe "$PROJECT" 'echo out > /srv/data/f; cat /srv/data/f' -m "$TMP/data:/srv/data:rw")"
+is 'the freeze did not reach the project' 'still' \
+   "$(probe "$PROJECT" 'echo still > w; cat w' -m "$TMP/sibling:/srv/sib")"
+is 'the freeze did not reach the sandbox home' 'still' \
+   "$(probe "$PROJECT" 'echo still > "$HOME/w"; cat "$HOME/w"' -m "$TMP/sibling:/srv/sib")"
+is 'scratch is still writable: /var/tmp' 'scratch' \
+   "$(probe "$PROJECT" 'echo scratch > /var/tmp/x; cat /var/tmp/x')"
+if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "${XDG_RUNTIME_DIR:-}" ]; then
+    is 'scratch is still writable: the runtime directory' 'scratch' \
+       "$(probe "$PROJECT" 'echo scratch > "$XDG_RUNTIME_DIR/x"; cat "$XDG_RUNTIME_DIR/x"')"
+else
+    skip 'scratch is still writable: the runtime directory' 'XDG_RUNTIME_DIR is not set'
+fi
+
+
+section 'guards'
+
+corral_err "$HOST_HOME" --dry-run
+isnt 'the home directory is refused as the project' '0' "$PSTATUS"
+has  'the refusal explains itself' 'home directory or the filesystem root' "$ERR_OUT"
+corral_err "$HOST_HOME" --force --dry-run
+is   '--force overrides the refusal' '0' "$PSTATUS"
+corral_err "$PROJECT" -m "$HOST_HOME" --dry-run
+isnt 'the home directory is refused as a mount source' '0' "$PSTATUS"
+corral_err "$PROJECT" -u 'Bad Name' --dry-run
+isnt 'an invalid user name is refused' '0' "$PSTATUS"
+corral_err "$PROJECT" -n bogus --dry-run
+isnt 'an unknown network mode is refused' '0' "$PSTATUS"
+
+
+section 'invocation'
+
+corral_err "$PROJECT" --dry-run
+is  '--dry-run succeeds' '0' "$PSTATUS"
+has '--dry-run prints the bwrap command' 'bwrap' "$ERR_OUT"
+is  '--dry-run does not run anything' 'gone' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run -x touch "$PROJECT/dryrun" >/dev/null 2>&1
+       [ -e "$PROJECT/dryrun" ] && echo there || echo gone)"
+(cd "$PROJECT" && "$CORRAL_BIN" -x sh -c 'exit 42' >/dev/null 2>&1)
+is  'the command exit status propagates' '42' "$?"
+out=$(cd "$PROJECT" && "$CORRAL_BIN" -x true 2>&1 >/dev/null)
+is  'a good run says nothing on stderr' '' "$out"
+
+
+section 'networking'
+
+port=$(python3 -c 'import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+python3 -c 'import socket,sys,time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8); time.sleep(120)' "$port" &
+LOOPPID=$!
+trap '[ -n "$LOOPPID" ] && kill "$LOOPPID" 2>/dev/null; cleanup' EXIT
+sleep 0.5
+
+reach="import socket
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect((\"127.0.0.1\", $port)); print(\"open\")
+except OSError:
+    print(\"closed\")"
+links='import socket
+print(" ".join(sorted(n for _, n in socket.if_nameindex())))'
+
+if python3 -c "$reach" | grep -q open; then
+    is 'none: the host loopback is unreachable' 'closed' "$(py "$reach" -n none)"
+    is 'host: the host loopback is reachable' 'open' "$(py "$reach" -n host)"
+else
+    skip 'none: the host loopback is unreachable' 'the test listener never came up'
+    skip 'host: the host loopback is reachable' 'the test listener never came up'
+fi
+is 'none: only the loopback interface exists' 'lo' "$(py "$links" -n none)"
+isnt 'host: the host interfaces are visible' 'lo' "$(py "$links" -n host)"
+
+if pasta --config-net --no-map-gw --quiet -- /bin/true >/dev/null 2>&1; then
+    is 'private: the host loopback is unreachable' 'closed' "$(py "$reach" -n private)"
+    isnt 'private: an interface beyond loopback exists' 'lo' "$(py "$links" -n private)"
+    is 'private: the gateway is not mapped to the host' 'closed' \
+       "$(py 'import socket
+s = socket.socket(); s.settimeout(3)
+try:
+    with open("/proc/net/route") as f:
+        gw = [l.split() for l in f][1:]
+    ip = [x[2] for x in gw if x[1] == "00000000"][0]
+    addr = ".".join(str(int(ip[i:i+2], 16)) for i in (6, 4, 2, 0))
+    s.connect((addr, '"$port"')); print("open")
+except (OSError, IndexError):
+    print("closed")' -n private)"
+else
+    skip 'private: the host loopback is unreachable' 'pasta cannot run here'
+    skip 'private: an interface beyond loopback exists' 'pasta cannot run here'
+    skip 'private: the gateway is not mapped to the host' 'pasta cannot run here'
+fi
+
+
+printf '\n%d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
+[ "$failed" -eq 0 ]
