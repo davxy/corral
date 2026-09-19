@@ -781,5 +781,56 @@ row=$(sysctl_row user.max_user_namespaces 0 fails)
 is  'a zero namespace limit fails' 'FAIL' "${row%% *}"
 
 
+section 'mounts inside the project'
+
+# The project bind comes last, so a mount whose target is the project or a
+# directory inside it has to be emitted after that bind, or the bind covers
+# it and the mount is silently lost. '-m .::ro' is the read-only project, for
+# an untrusted checkout or someone else's build script.
+echo readable > "$PROJECT/readable"
+has 'the project is read only under -m .::ro' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch ro-marker' -m .::ro)"
+is  'and nothing reached the host' 'gone' \
+    "$([ -e "$PROJECT/ro-marker" ] && echo there || echo gone)"
+is  'reading still works' 'readable' "$(probe "$PROJECT" 'cat readable' -m .::ro)"
+is  'the home is still writable' 'kept' \
+    "$(probe "$PROJECT" 'echo kept > "$HOME/ro-state"; cat "$HOME/ro-state"' -m .::ro)"
+mkdir -p "$PROJECT/vendor"
+has 'a directory inside the project can be bound read only' 'Read-only file system' \
+    "$(probe "$PROJECT" 'touch vendor/ro-marker' -m ./vendor::ro)"
+is  'while the rest of the project stays writable' 'yes' \
+    "$(probe "$PROJECT" 'touch rw-marker && echo yes' -m ./vendor::ro)"
+corral_err "$PROJECT" --dry-run -m .::ro
+after=${ERR_OUT##*--bind $PROJECT $PROJECT }
+is  'the read-only bind of the project follows the project bind' \
+    "--ro-bind $PROJECT $PROJECT" "$(printf '%s' "$after" | cut -d' ' -f1-3)"
+
+# A target inside the project gets no invented mount point: the project is
+# writable, so bwrap creates the directory there, and it stays on the host.
+mkdir -p "$TMP/inside-source"
+echo from-source > "$TMP/inside-source/file"
+is 'a missing target inside the project is created and the mount shows' 'from-source' \
+   "$(probe "$PROJECT" 'cat fresh/file' -m "$TMP/inside-source:$PROJECT/fresh")"
+is 'and the mount point stays on the host, empty' 'there, empty' \
+   "$([ -d "$PROJECT/fresh" ] && [ -z "$(ls -A "$PROJECT/fresh")" ] && echo 'there, empty' || echo other)"
+
+# An overlay on a read-only project is the build-script case: the script
+# writes and finishes, and the checkout underneath is never touched.
+if has_overlay_bwrap; then
+    is 'an overlay over a read-only project takes the writes' 'v2' \
+       "$(probe "$PROJECT" 'echo v2 > readable; cat readable' -m .::ro -m .::tmp)"
+    is 'and the checkout on the host is untouched' 'readable' "$(cat "$PROJECT/readable" 2>&1)"
+else
+    skip 'an overlay over a read-only project takes the writes' 'this bwrap has no overlay options'
+fi
+
+# The mount is a restriction, so a project file may ask for it.
+ROPROJECT="$TMP/ro-project"
+mkdir -p "$ROPROJECT"
+printf 'mounts = [".::ro"]\n' > "$ROPROJECT/.corral.toml"
+has 'a project file can make its own project read only' 'Read-only file system' \
+    "$(probe "$ROPROJECT" 'touch x')"
+
+
 printf '\n%d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

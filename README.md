@@ -14,6 +14,7 @@ corral -u throwaway       # run as another sandbox user
 corral -m ../core         # also mount a sibling, read only, same path inside
 corral -m /data:/data:rw  # mount a chosen path, writable
 corral -m ./sdk::tmp      # writable, but the writes vanish at exit
+corral -m .::ro           # the project read only too, for an untrusted checkout
 corral -e RUST_LOG=1      # set a variable inside for this run
 corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
@@ -208,8 +209,9 @@ them would come along. `--force` overrides that.
 
 You are not root on the host, and the rootfs arrives read only, so:
 
-- Everything under the project directory is a real host write. Files come out
-  owned by you, including deletions and overwrites.
+- Everything under the project directory is a real host write, unless you
+  bound it read only with [`-m .::ro`](#extra-mounts). Files come out owned
+  by you, including deletions and overwrites.
 - `/home/<user>` is a real host write, landing in `<homes>/<user>`.
 - `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR` are fresh tmpfs mounts. Writes
   there succeed and are discarded on exit.
@@ -336,6 +338,16 @@ mounts that were made inside it, so doing this last would drop a tmpfs over
 place — read only, and entirely readable. Invented parents are read only, like
 the rest of the [skeleton](#what-you-can-write).
 
+A mount whose target is the project, or a directory inside it, goes after the
+project bind instead, because that bind is the last one and would cover it
+otherwise. `-m .::ro` is the project itself, bound read only, for an
+untrusted checkout or someone else's build script. `-m ./vendor::ro` keeps
+one directory out of reach. A missing target inside the project gets no
+invented mount point: the project is writable, so `bwrap` creates the
+directory there, and it stays on the host. A project can ask for the
+read-only bind in its own file with `mounts = [".::ro"]`, since it only takes
+something away.
+
 ## Writes that go nowhere
 
 `:tmp` is the third mount mode. The host path becomes a read-only lower layer,
@@ -381,7 +393,9 @@ passwd is bound last and stays on top of it.
 `-m .::tmp` names the project itself, which covers the project bind and makes
 the whole working directory a throwaway copy. That is a real use, and it is
 also the one case where the [first promise of this tool](#the-working-directory)
-stops holding, so it takes an explicit flag to get.
+stops holding, so it takes an explicit flag to get. On top of `-m .::ro`, a
+build script writes into the copy and finishes, and the checkout underneath
+is never touched.
 
 ## Environment variables
 
@@ -564,10 +578,10 @@ map.
 This bounds the filesystem and the host's own loopback. It is not a security
 boundary against something actively hostile.
 
-- Whatever directory you start in is fully writable. The protection is a
-  function of where you start: `$HOME` and `/` are refused unless `--force`
-  is passed, but anything below them is fair game, and a launch from `~/work`
-  mounts everything under it without a word.
+- Whatever directory you start in is fully writable, unless `-m .::ro` is
+  given. The protection is a function of where you start: `$HOME` and `/`
+  are refused unless `--force` is passed, but anything below them is fair
+  game, and a launch from `~/work` mounts everything under it without a word.
 - Outbound network access is unrestricted in `private` and `host`. The LAN is
   reachable in both. `private` keeps the sandbox off the host's loopback and
   nothing more.
@@ -595,17 +609,18 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 203 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 215 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
-that empties it, that a `.corral.toml` adds what it says and no more, that
-`list` and `remove` see real homes and nothing else, and that `check` fails
-only when corral cannot run.
+that empties it, that a mount inside the project takes effect, that a
+`.corral.toml` adds what it says and no more, that `list` and `remove` see
+real homes and nothing else, and that `check` fails only when corral cannot
+run.
 
 ```
 $ ./tests/corral-test
 ...
-199 passed, 0 failed, 4 skipped
+211 passed, 0 failed, 4 skipped
 ```
 
 It needs no configuration: it writes its own `config.toml` under a temporary

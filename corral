@@ -257,6 +257,14 @@ def scaffold(target, tmpfs_roots):
     return args
 
 
+def inside_project(target):
+    return target == CWD or CWD in target.parents
+
+
+def bind_args(source, target, mode):
+    return ["--bind" if mode == "rw" else "--ro-bind", str(source), str(target)]
+
+
 def build_command(config, project, args):
     username = args.user or project.get("user") or config.get("default_user") or DEFAULT_USER
     if not USERNAME_RE.match(username):
@@ -305,11 +313,14 @@ def build_command(config, project, args):
     # because the parent a mount point needs is often an ancestor of one of
     # them; see scaffold. Nothing here is placed under a tmpfs that is about to
     # be laid down, since bwrap creates a mount point in a tmpfs by itself.
+    # Nor under the project: that is writable, so bwrap creates the mount
+    # point there, and it stays on the host.
     scaffolding = []
     if tools:
         scaffolding += scaffold(Path(TOOLS_GUEST), tmpfs_roots)
     for _, target, _ in mounts:
-        scaffolding += scaffold(target, tmpfs_roots)
+        if not inside_project(target):
+            scaffolding += scaffold(target, tmpfs_roots)
 
     command = ["bwrap", "--ro-bind", "/", "/"] + scaffolding + [
         "--dev", "/dev",
@@ -325,13 +336,20 @@ def build_command(config, project, args):
 
     if tools:
         command += ["--ro-bind", str(tools), TOOLS_GUEST]
-    for source, target, mode in mounts:
-        if mode != "tmp":
-            command += ["--bind" if mode == "rw" else "--ro-bind", str(source), str(target)]
+    binds = [(source, target, mode) for source, target, mode in mounts if mode != "tmp"]
+    for source, target, mode in binds:
+        if not inside_project(target):
+            command += bind_args(source, target, mode)
 
     # Last of the binds, because the project usually lives under a directory
     # that one of the tmpfs mounts above has just emptied.
     command += ["--bind", str(CWD), str(CWD)]
+
+    # Except for a bind inside the project, which that bind would cover.
+    # '-m .::ro' is the project itself, read only.
+    for source, target, mode in binds:
+        if inside_project(target):
+            command += bind_args(source, target, mode)
 
     # After every bind, because an overlay has to sit on top of whatever holds
     # its target. An overlay on a directory inside the project needs the
@@ -702,7 +720,7 @@ def main():
     parser.add_argument("-m", "--mount", action="append", default=[],
                         metavar="HOST[:GUEST[:ro|rw|tmp]]",
                         help="bind another host path, read only unless ':rw', or ':tmp' for "
-                             "writes that the host never sees")
+                             "writes that the host never sees; '.' is the project itself")
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
                         help="set a variable, or forward the host's value")
     parser.add_argument("-n", "--net", choices=NETWORKS, help="network mode for this run")
