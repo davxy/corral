@@ -701,5 +701,85 @@ is 'list works without bwrap on PATH' 'corral unused' \
    "$(LIST_OUT=$(cd "$PROJECT" && PATH="$TMP/nobwrap" "$CORRAL_BIN" list 2>&1); rows)"
 
 
+section 'check'
+
+# A first run on a recent Ubuntu dies with a raw bwrap error, and nothing
+# says that an AppArmor sysctl is the cause. 'check' reports each thing corral
+# depends on with a state, and exits non-zero only when corral cannot run at
+# all. Where this suite runs, bwrap can create a user namespace, so the status
+# is 0 whatever pasta manages.
+CHECK_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" check 2>&1); status=$?
+line() { printf '%s\n' "$CHECK_OUT" | awk -v subject="$1" 'index($0, subject) == 1'; }
+is    'check succeeds where the suite runs' '0' "$status"
+has   'check reports bwrap with its version' 'bubblewrap' "$(line bwrap)"
+has   'check reports the user namespace probe' 'ok' "$(line 'user namespace')"
+for name in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_clone \
+            user.max_user_namespaces; do
+    isnt "check reports $name" '' "$(line "$name")"
+done
+isnt  'check reports pasta' '' "$(line pasta)"
+hasnt 'nothing fails here' 'FAIL' "$CHECK_OUT"
+hasnt 'pasta is never a failure' 'FAIL' "$(line pasta)"
+corral_err "$PROJECT" check extra
+isnt  'check takes no argument' '0' "$PSTATUS"
+
+# Without bwrap there is nothing to run, and that is the one message a fresh
+# machine needs most. pasta only matters for one network mode, so its absence
+# is a warning that says which package it comes from.
+CHECK_OUT=$(cd "$PROJECT" && PATH="$TMP/nobwrap" "$CORRAL_BIN" check 2>&1); status=$?
+isnt 'check fails without bwrap' '0' "$status"
+has  'and says what to install' 'bubblewrap' "$(line bwrap)"
+has  'with the state spelled out' 'FAIL' "$(line bwrap)"
+has  'a missing pasta is a warning that names the package' 'passt' "$(line pasta)"
+has  'and a warning only' 'warn' "$(line pasta)"
+
+# The AppArmor case: bwrap is there and the kernel refuses the namespace. The
+# probe's own error is what a bug report needs, so it is shown as is. An old
+# bwrap loses ':tmp' mounts and nothing else, which is a warning.
+mkdir -p "$TMP/denybin"
+cat > "$TMP/denybin/bwrap" <<'EOF'
+#!/bin/sh
+case "$1" in
+    --version) echo "bubblewrap 0.9.0";;
+    --help) echo "usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]";;
+    *) echo "bwrap: setting up uid map: Permission denied" >&2; exit 1;;
+esac
+EOF
+chmod +x "$TMP/denybin/bwrap"
+CHECK_OUT=$(cd "$PROJECT" && PATH="$TMP/denybin:$PATH" "$CORRAL_BIN" check 2>&1); status=$?
+isnt 'check fails when bwrap cannot create a user namespace' '0' "$status"
+has  "and shows bwrap's own error" 'Permission denied' "$(line 'user namespace')"
+has  'an old bwrap is a warning, not a failure' 'warn' "$(line bwrap)"
+has  'and it names the :tmp mounts it cannot do' ':tmp' "$(line bwrap)"
+
+# A denying sysctl is the cause only when the probe failed, and the remedy is
+# printed only then: on an Ubuntu whose AppArmor profile lets bwrap through,
+# the sysctl reads 1 and nothing is wrong. A test cannot change /proc/sys, so
+# the row function is called directly with each value.
+sysctl_row() {
+    python3 - "$CORRAL_BIN" "$@" <<'EOF'
+import sys
+corral = {"__name__": "corral"}
+exec(open(sys.argv[1]).read(), corral)
+name, value, probe = sys.argv[2], sys.argv[3], sys.argv[4] == "works"
+state, detail, remedy = corral["sysctl_row"](name, None if value == "absent" else value, probe)
+print(state, detail, remedy or "no remedy")
+EOF
+}
+row=$(sysctl_row kernel.apparmor_restrict_unprivileged_userns 1 fails)
+is  'a denying sysctl fails when the probe failed' 'FAIL' "${row%% *}"
+has 'and carries the sysctl command' 'sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0' "$row"
+row=$(sysctl_row kernel.apparmor_restrict_unprivileged_userns 1 works)
+is  'a denying sysctl is ok when the probe passed' 'ok' "${row%% *}"
+has 'and has no remedy' 'no remedy' "$row"
+row=$(sysctl_row kernel.unprivileged_userns_clone 1 fails)
+is  'a permissive value is ok' 'ok' "${row%% *}"
+row=$(sysctl_row user.max_user_namespaces absent fails)
+is  'an absent sysctl is ok' 'ok' "${row%% *}"
+has 'and says so' 'absent' "$row"
+row=$(sysctl_row user.max_user_namespaces 0 fails)
+is  'a zero namespace limit fails' 'FAIL' "${row%% *}"
+
+
 printf '\n%d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

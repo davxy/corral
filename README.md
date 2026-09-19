@@ -21,6 +21,7 @@ corral --dry-run          # print the bwrap command and exit
 corral claude             # run a tool directly instead of the shell
 corral list               # the sandbox homes, their size and last start
 corral remove NAME        # delete one, after a confirmation
+corral check              # report what this host is missing
 corral --help
 ```
 
@@ -42,6 +43,35 @@ sudo apt install bubblewrap passt        # Debian, Ubuntu
 rather than fall back to a weaker mode without a word. `:tmp` mounts need
 `bubblewrap` 0.11.0 or newer, which Ubuntu 24.04 does not have, and `corral`
 says so instead of leaving `bwrap` to fail on an unknown option.
+
+## Checking the host
+
+`corral check` reports each thing corral depends on, with a state and what to
+do about it. It reads no config, so it is the first thing to run on a new
+machine:
+
+```
+$ corral check
+bwrap                                         ok    bubblewrap 0.12.0
+user namespace                                ok    bwrap can create one
+kernel.apparmor_restrict_unprivileged_userns  ok    absent
+kernel.unprivileged_userns_clone              ok    1
+user.max_user_namespaces                      ok    2147483647
+pasta                                         ok    pasta 2026_07_28.f8df3f1
+```
+
+The user namespace line is the verdict. It runs `bwrap` with the namespace
+flags corral uses and shows bwrap's own error when that fails. The three
+sysctls under it are the usual reasons: Ubuntu 23.10 and later ship the first
+at 1, older Debian derivatives the second at 0, and the third at 0 allows no
+namespace at all. A denying value is reported as the cause only when the
+probe failed, and the `sysctl -w` that lifts it is printed then. When the
+probe passed, the value is shown and nothing more, because an AppArmor
+profile can let bwrap through while the sysctl still reads 1.
+
+`pasta` is a warning, never a failure: without it the `private` network mode
+refuses to start, and `-n host` and `-n none` still work. The exit status is
+1 when any line says `FAIL`, so a setup script can stop on it.
 
 ## Configuration
 
@@ -468,8 +498,8 @@ corral --resume claude     # error: corral has no --resume
 ```
 
 A command that starts with a dash needs `--` in front of it, and so does a
-program called `list` or `remove`, since those are corral's own verbs. That
-first `--` is corral's; a second one belongs to the command:
+program called `list`, `remove` or `check`, since those are corral's own
+verbs. That first `--` is corral's; a second one belongs to the command:
 
 ```
 corral -- ./-weird-name
@@ -565,16 +595,17 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 176 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 203 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
-that empties it, that a `.corral.toml` adds what it says and no more, and that
-`list` and `remove` see real homes and nothing else.
+that empties it, that a `.corral.toml` adds what it says and no more, that
+`list` and `remove` see real homes and nothing else, and that `check` fails
+only when corral cannot run.
 
 ```
 $ ./tests/corral-test
 ...
-172 passed, 0 failed, 4 skipped
+199 passed, 0 failed, 4 skipped
 ```
 
 It needs no configuration: it writes its own `config.toml` under a temporary
@@ -596,7 +627,7 @@ CI runs the suite on `ubuntu-26.04` (`.github/workflows/test.yml`), because
 and later deny unprivileged user namespaces by AppArmor policy, which
 corral cannot work without, so the workflow lifts that sysctl before running.
 The same policy is why corral may fail out of the box on a recent Ubuntu
-workstation.
+workstation, and `corral check` names it.
 
 ## License
 

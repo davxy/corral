@@ -61,6 +61,19 @@ DROPPED_ENV = (
     "XDG_STATE_HOME",
 )
 
+OK, WARN, FAIL = "ok", "warn", "FAIL"
+
+# The usual reasons an unprivileged user namespace is refused: the value that
+# denies it, the value to set instead, and what the denial means.
+SYSCTLS = {
+    "kernel.apparmor_restrict_unprivileged_userns":
+        ("1", "0", "AppArmor denies unprivileged user namespaces"),
+    "kernel.unprivileged_userns_clone":
+        ("0", "1", "unprivileged user namespaces are disabled"),
+    "user.max_user_namespaces":
+        ("0", "10000", "no user namespace may be created"),
+}
+
 
 def ask_confirmation(prompt):
     return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
@@ -154,13 +167,17 @@ def guard_overlays(mounts):
                                  f"overlayfs refuses a lower layer that holds a mount point.")
 
 
+def bwrap_has_overlay():
+    usage = subprocess.run(["bwrap", "--help"], capture_output=True, text=True)
+    return "--tmp-overlay" in usage.stdout + usage.stderr
+
+
 def guard_bwrap_overlay(mounts):
     """bwrap grew the overlay options in 0.11.0. An older one dies on the first
     of them with 'Unknown option', which does not say what to install."""
     if all(mode != "tmp" for _, _, mode in mounts):
         return
-    usage = subprocess.run(["bwrap", "--help"], capture_output=True, text=True)
-    if "--tmp-overlay" not in usage.stdout + usage.stderr:
+    if not bwrap_has_overlay():
         raise SystemExit("':tmp' needs bwrap 0.11.0 or newer; this one has no --tmp-overlay.")
 
 
@@ -484,6 +501,95 @@ def remove_home(rest):
     print(f"Removed '{home}'.")
 
 
+def read_sysctl(name):
+    try:
+        return (Path("/proc/sys") / name.replace(".", "/")).read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def sysctl_row(name, value, namespaces_work):
+    """The state of one sysctl, given what bwrap itself managed.
+
+    A denying value is the cause only when the probe failed: an AppArmor
+    profile can let bwrap through while the sysctl still reads 1.
+    """
+    denying, allowing, meaning = SYSCTLS[name]
+    if value is None:
+        return OK, "absent", None
+    if value != denying:
+        return OK, value, None
+    if namespaces_work:
+        return OK, f"{value}, but bwrap works regardless", None
+    return FAIL, f"{value}: {meaning}", f"sudo sysctl -w {name}={allowing}"
+
+
+def tool_version(tool):
+    output = subprocess.run([tool, "--version"], capture_output=True, text=True).stdout
+    return output.partition("\n")[0]
+
+
+def probe(command):
+    """Whether the command ran, and otherwise the last line it wrote to
+    stderr, which is where bwrap and pasta say what went wrong."""
+    run = subprocess.run(command, capture_output=True, text=True)
+    if run.returncode == 0:
+        return True, ""
+    lines = run.stderr.strip().splitlines()
+    return False, lines[-1] if lines else f"exit status {run.returncode}"
+
+
+def check_host(rest):
+    argparse.ArgumentParser(prog="corral check",
+                            description="Report what this host is missing.").parse_args(rest)
+    rows = []
+    remedies = []
+    namespaces_work = False
+    if not shutil.which("bwrap"):
+        rows.append(("bwrap", FAIL, "not on PATH; install bubblewrap"))
+    else:
+        version = tool_version("bwrap")
+        if bwrap_has_overlay():
+            rows.append(("bwrap", OK, version))
+        else:
+            rows.append(("bwrap", WARN, f"{version}, older than 0.11.0, so ':tmp' mounts "
+                                        f"are unavailable"))
+        namespaces_work, error = probe([
+            "bwrap", "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
+            "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net", "--", "true"])
+        if namespaces_work:
+            rows.append(("user namespace", OK, "bwrap can create one"))
+        else:
+            rows.append(("user namespace", FAIL, error))
+    for name in SYSCTLS:
+        state, detail, remedy = sysctl_row(name, read_sysctl(name), namespaces_work)
+        rows.append((name, state, detail))
+        if remedy:
+            remedies.append(remedy)
+    if not shutil.which("pasta"):
+        rows.append(("pasta", WARN, "not on PATH; the 'private' network mode needs it, "
+                                    "from the passt package"))
+    else:
+        version = tool_version("pasta")
+        works, error = probe(["pasta", "--config-net", "--no-map-gw", "--quiet", "--", "true"])
+        if works:
+            rows.append(("pasta", OK, version))
+        else:
+            rows.append(("pasta", WARN, f"{version}, cannot run: {error}; 'private' will "
+                                        f"fail, so use -n host or -n none"))
+
+    width = max(len(subject) for subject, _, _ in rows)
+    for subject, state, detail in rows:
+        print(f"{subject:<{width}}  {state:<4}  {detail}")
+    if remedies:
+        print("\nTo fix it:")
+        for remedy in remedies:
+            print(f"  {remedy}")
+        print("The same setting in /etc/sysctl.d/ keeps it across reboots.")
+    if any(state == FAIL for _, state, _ in rows):
+        raise SystemExit(1)
+
+
 def read_table(path, label):
     try:
         return tomllib.loads(path.read_text())
@@ -582,13 +688,15 @@ def main():
         # '...' on a line of its own, which names nothing.
         usage="corral [OPTION ...] [COMMAND [ARG ...]]\n"
               "       corral list\n"
-              "       corral remove USER",
+              "       corral remove USER\n"
+              "       corral check",
         description="Run a shell with the current directory writable and the rest of "
                     "the host read only.",
-        epilog=f"'list' shows the sandbox homes and 'remove' deletes one; put '--' first "
-               f"to run a program by one of those names. Settings live in '{CONFIG_PATH}' "
-               f"and are asked for when missing. A '{PROJECT_FILE}' in the working "
-               f"directory adds flags for that project.",
+        epilog=f"'list' shows the sandbox homes, 'remove' deletes one and 'check' reports "
+               f"what this host is missing; put '--' first to run a program by one of "
+               f"those names. Settings live in '{CONFIG_PATH}' and are asked for when "
+               f"missing. A '{PROJECT_FILE}' in the working directory adds flags for that "
+               f"project.",
     )
     parser.add_argument("-u", "--user", help="sandbox user to run as")
     parser.add_argument("-m", "--mount", action="append", default=[],
@@ -616,9 +724,9 @@ def main():
 
     # REMAINDER hands the separator over with the rest, so '--' would arrive as
     # the program to run. Only the first one is corral's; a later one is the
-    # command's own. It also makes a 'list' or 'remove' after it a program to
-    # run rather than corral's own verb.
-    verbs = {"list": list_homes, "remove": remove_home}
+    # command's own. It also makes a 'list', 'remove' or 'check' after it a
+    # program to run rather than corral's own verb.
+    verbs = {"list": list_homes, "remove": remove_home, "check": check_host}
     if args.command[:1] == ["--"]:
         del args.command[0]
     elif args.command and args.command[0] in verbs:
