@@ -90,6 +90,10 @@ py() { probe "$PROJECT" "python3 -c '$1'" "${@:2}"; }
 # directory only mean something on a host where it has none.
 has_submount() { awk -v d="$1/" '$5 ~ "^"d { found = 1 } END { exit !found }' /proc/self/mountinfo; }
 
+# has_overlay_bwrap - true when bwrap knows the overlay options, which arrived
+# in 0.11.0. Without them there is no ':tmp' to test, and corral says so.
+has_overlay_bwrap() { bwrap --help 2>/dev/null | grep -q -- --tmp-overlay; }
+
 
 section 'markers and identity'
 
@@ -254,56 +258,69 @@ section 'overlay mounts'
 # fails the write, and one to ':rw' reaches the host, so both show up here.
 mkdir -p "$TMP/lower/sub"
 echo base > "$TMP/lower/sub/file"
-is 'a tmp mount reads the lower layer' 'base' \
-   "$(probe "$PROJECT" 'cat '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp")"
-is 'a tmp mount takes a write and reads it back' 'changed' \
-   "$(probe "$PROJECT" 'echo changed > '"$TMP"'/lower/sub/file; cat '"$TMP"'/lower/sub/file' \
-      -m "$TMP/lower::tmp")"
-is 'the host file still holds the old content' 'base' "$(cat "$TMP/lower/sub/file" 2>&1)"
-probe "$PROJECT" 'touch '"$TMP"'/lower/created' -m "$TMP/lower::tmp" >/dev/null
-is 'a file created in a tmp mount never reaches the host' 'gone' \
-   "$([ -e "$TMP/lower/created" ] && echo there || echo gone)"
-probe "$PROJECT" 'rm '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp" >/dev/null
-is 'a deletion in a tmp mount never reaches the host' 'there' \
-   "$([ -e "$TMP/lower/sub/file" ] && echo there || echo gone)"
-is 'an explicit guest path is honoured for tmp' 'base' \
-   "$(probe "$PROJECT" 'cat /scratch/sub/file' -m "$TMP/lower:/scratch:tmp")"
+if has_overlay_bwrap; then
+    is 'a tmp mount reads the lower layer' 'base' \
+       "$(probe "$PROJECT" 'cat '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp")"
+    is 'a tmp mount takes a write and reads it back' 'changed' \
+       "$(probe "$PROJECT" 'echo changed > '"$TMP"'/lower/sub/file; cat '"$TMP"'/lower/sub/file' \
+          -m "$TMP/lower::tmp")"
+    is 'the host file still holds the old content' 'base' "$(cat "$TMP/lower/sub/file" 2>&1)"
+    probe "$PROJECT" 'touch '"$TMP"'/lower/created' -m "$TMP/lower::tmp" >/dev/null
+    is 'a file created in a tmp mount never reaches the host' 'gone' \
+       "$([ -e "$TMP/lower/created" ] && echo there || echo gone)"
+    probe "$PROJECT" 'rm '"$TMP"'/lower/sub/file' -m "$TMP/lower::tmp" >/dev/null
+    is 'a deletion in a tmp mount never reaches the host' 'there' \
+       "$([ -e "$TMP/lower/sub/file" ] && echo there || echo gone)"
+    is 'an explicit guest path is honoured for tmp' 'base' \
+       "$(probe "$PROJECT" 'cat /scratch/sub/file' -m "$TMP/lower:/scratch:tmp")"
 
-# An overlay inside the project needs the project bound first. Emitted before
-# that bind, the bind covers the overlay and the write lands on the host, which
-# is the exact opposite of what ':tmp' was asked for.
-mkdir -p "$PROJECT/vendor"
-echo v1 > "$PROJECT/vendor/version"
-is 'a tmp mount inside the project reads back as written' 'v2' \
-   "$(probe "$PROJECT" 'echo v2 > vendor/version; cat vendor/version' -m "$PROJECT/vendor::tmp")"
-is 'and the project directory on the host is untouched' 'v1' \
-   "$(cat "$PROJECT/vendor/version" 2>&1)"
+    # An overlay inside the project needs the project bound first. Emitted before
+    # that bind, the bind covers the overlay and the write lands on the host, which
+    # is the exact opposite of what ':tmp' was asked for.
+    mkdir -p "$PROJECT/vendor"
+    echo v1 > "$PROJECT/vendor/version"
+    is 'a tmp mount inside the project reads back as written' 'v2' \
+       "$(probe "$PROJECT" 'echo v2 > vendor/version; cat vendor/version' -m "$PROJECT/vendor::tmp")"
+    is 'and the project directory on the host is untouched' 'v1' \
+       "$(cat "$PROJECT/vendor/version" 2>&1)"
 
-# An overlay covers whatever already stands at its target, so it has to be
-# emitted before the generated passwd. After it, the overlay would bury that
-# passwd and getpwuid() would answer with the host's entry for uid 0.
-if has_submount /etc; then
-    skip 'an overlay on /etc keeps the generated passwd' '/etc holds a mount point here'
+    # An overlay covers whatever already stands at its target, so it has to be
+    # emitted before the generated passwd. After it, the overlay would bury that
+    # passwd and getpwuid() would answer with the host's entry for uid 0.
+    if has_submount /etc; then
+        skip 'an overlay on /etc keeps the generated passwd' '/etc holds a mount point here'
+    else
+        is 'an overlay on /etc keeps the generated passwd' '/home/corral' \
+           "$(probe "$PROJECT" 'getent passwd "$(id -u)" | cut -d: -f6' -m '/etc::tmp')"
+        isnt 'and the rest of /etc still shows through the overlay' '' \
+             "$(probe "$PROJECT" 'ls -A /etc | head -1' -m '/etc::tmp')"
+    fi
+
+    # A copied-up file keeps its owner, and the sandbox maps one uid, so an overlay
+    # over a tree owned by another user takes new entries at its top level and
+    # nothing below. The README says so; this keeps the claim honest.
+    if has_submount /usr; then
+        skip 'a tmp mount cannot write into a directory owned by another user' \
+             '/usr holds a mount point here'
+    elif [ "$(stat -c %u /usr/lib)" = "$(id -u)" ]; then
+        skip 'a tmp mount cannot write into a directory owned by another user' \
+             '/usr/lib belongs to the caller here'
+    else
+        has 'a tmp mount cannot write into a directory owned by another user' 'Permission denied' \
+            "$(probe "$PROJECT" 'touch /usr/lib/corral-test-probe' -m '/usr::tmp')"
+    fi
 else
-    is 'an overlay on /etc keeps the generated passwd' '/home/corral' \
-       "$(probe "$PROJECT" 'getent passwd "$(id -u)" | cut -d: -f6' -m '/etc::tmp')"
-    isnt 'and the rest of /etc still shows through the overlay' '' \
-         "$(probe "$PROJECT" 'ls -A /etc | head -1' -m '/etc::tmp')"
+    skip 'every tmp mount assertion' 'this bwrap has no overlay options'
 fi
 
-# A copied-up file keeps its owner, and the sandbox maps one uid, so an overlay
-# over a tree owned by another user takes new entries at its top level and
-# nothing below. The README says so; this keeps the claim honest.
-if has_submount /usr; then
-    skip 'a tmp mount cannot write into a directory owned by another user' \
-         '/usr holds a mount point here'
-elif [ "$(stat -c %u /usr/lib)" = "$(id -u)" ]; then
-    skip 'a tmp mount cannot write into a directory owned by another user' \
-         '/usr/lib belongs to the caller here'
-else
-    has 'a tmp mount cannot write into a directory owned by another user' 'Permission denied' \
-        "$(probe "$PROJECT" 'touch /usr/lib/corral-test-probe' -m '/usr::tmp')"
-fi
+# A bwrap older than 0.11.0 knows no overlay options. corral names the version
+# needed instead of leaving bwrap's 'Unknown option' to explain.
+mkdir -p "$TMP/oldbin"
+printf '#!/bin/sh\necho "usage: bwrap [OPTIONS...] [--] COMMAND [ARGS...]"\n' > "$TMP/oldbin/bwrap"
+chmod +x "$TMP/oldbin/bwrap"
+PATH="$TMP/oldbin:$PATH" corral_err "$PROJECT" -m "$TMP/lower::tmp" --dry-run
+isnt 'an old bwrap is refused for tmp' '0' "$PSTATUS"
+has  'the refusal names the version needed' '0.11.0' "$ERR_OUT"
 
 corral_err "$PROJECT" -m "$TMP/lower::tmp" -m "$TMP/lower/sub:/x:tmp" --dry-run
 isnt 'a tmp source inside another tmp source is refused' '0' "$PSTATUS"
@@ -434,8 +451,10 @@ is  'a command replaces the login shell' 'bash -lc true' "${ERR_OUT##*-- }"
 
 section 'networking'
 
-port=$(python3 -c 'import socket
-s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+free_port() { python3 -c 'import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'; }
+
+port=$(free_port)
 python3 -c 'import socket,sys,time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(8); time.sleep(120)' "$port" &
@@ -476,10 +495,24 @@ try:
     s.connect((addr, '"$port"')); print("open")
 except (OSError, IndexError):
     print("closed")' -n private)"
+
+    # pasta's default is to bind on the host every port the sandbox binds, and
+    # it looks for new ones once a second, so the host side has to wait that
+    # long before it can tell a closed port from one not yet forwarded.
+    inner=$(free_port)
+    py 'import socket,time
+s = socket.socket(); s.bind(("0.0.0.0", '"$inner"')); s.listen(1)
+time.sleep(4)' -n private >/dev/null &
+    INNERPID=$!
+    sleep 2
+    is 'private: a port bound inside is not bound on the host' 'closed' \
+       "$(python3 -c "${reach//$port/$inner}")"
+    wait "$INNERPID"
 else
     skip 'private: the host loopback is unreachable' 'pasta cannot run here'
     skip 'private: an interface beyond loopback exists' 'pasta cannot run here'
     skip 'private: the gateway is not mapped to the host' 'pasta cannot run here'
+    skip 'private: a port bound inside is not bound on the host' 'pasta cannot run here'
 fi
 
 

@@ -36,7 +36,9 @@ sudo apt install bubblewrap passt        # Debian, Ubuntu
 ```
 
 `corral` refuses to start the `private` network mode when `pasta` is absent,
-rather than fall back to a weaker mode without a word.
+rather than fall back to a weaker mode without a word. `:tmp` mounts need
+`bubblewrap` 0.11.0 or newer, which Ubuntu 24.04 does not have, and `corral`
+says so instead of leaving `bwrap` to fail on an unknown option.
 
 ## Configuration
 
@@ -348,9 +350,11 @@ has bound to `127.0.0.1` no longer answer, and two sandboxes at once do not
 compete for host ports. This is what Docker's `bridge` mode bought, without
 the bridge, the NAT rules or the daemon.
 
-`pasta` is invoked with `--no-map-gw`. Its default maps the host onto the
-gateway address, which would put every loopback service back within reach.
-Do not remove that flag.
+`pasta` is invoked with port forwarding off in both directions and with
+`--no-map-gw`. Left to its defaults it forwards every port bound on the host
+into the sandbox, binds every port the sandbox opens on the host, and maps the
+host onto the gateway address. Each of the three would put the loopback back
+within reach. Do not remove those flags.
 
 `host` shares the host's network namespace. Take it when you develop something
 that has to be reached from the host, or that has to talk to a database or a
@@ -478,7 +482,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 110 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 113 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, and that a project under `/home` survives the
 tmpfs that empties it.
@@ -486,7 +490,7 @@ tmpfs that empties it.
 ```
 $ ./tests/corral-test
 ...
-106 passed, 0 failed, 4 skipped
+108 passed, 0 failed, 5 skipped
 ```
 
 It needs no configuration: it writes its own `config.json` under a temporary
@@ -496,14 +500,16 @@ because *a project below `/home` still works* is one of the properties being
 asserted. Both are removed on exit, as is the single socket the
 agent-reachability test has to place in `$XDG_RUNTIME_DIR`.
 
-`bwrap` is required. The three `private`-mode assertions additionally need
+`bwrap` is required. The four `private`-mode assertions additionally need
 `pasta` to be able to run, and report `skip` when it cannot — which is what
 happens inside a sandbox with no `/dev/net/tun`, since running the suite from
-inside corral is a normal thing to do. A skip is printed, never folded into
-the pass count.
+inside corral is a normal thing to do. The `:tmp` assertions need a `bwrap`
+with the overlay options, 0.11.0 or newer, and report one `skip` on an older
+one. A skip is printed, never folded into the pass count.
 
-CI runs the suite on `ubuntu-latest` (`.github/workflows/test.yml`). Ubuntu
-23.10 and later deny unprivileged user namespaces by AppArmor policy, which
+CI runs the suite on `ubuntu-26.04` (`.github/workflows/test.yml`), because
+`ubuntu-latest` is still 24.04 and its `bubblewrap` is 0.9.0. Ubuntu 23.10
+and later deny unprivileged user namespaces by AppArmor policy, which
 corral cannot work without, so the workflow lifts that sysctl before running.
 The same policy is why corral may fail out of the box on a recent Ubuntu
 workstation.

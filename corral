@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -144,6 +145,16 @@ def guard_overlays(mounts):
                                  f"overlayfs refuses a lower layer that holds a mount point.")
 
 
+def guard_bwrap_overlay(mounts):
+    """bwrap grew the overlay options in 0.11.0. An older one dies on the first
+    of them with 'Unknown option', which does not say what to install."""
+    if all(mode != "tmp" for _, _, mode in mounts):
+        return
+    usage = subprocess.run(["bwrap", "--help"], capture_output=True, text=True)
+    if "--tmp-overlay" not in usage.stdout + usage.stderr:
+        raise SystemExit("':tmp' needs bwrap 0.11.0 or newer; this one has no --tmp-overlay.")
+
+
 def generated_etc(directory, username):
     """The /etc files that have to describe the sandbox rather than the host.
 
@@ -230,6 +241,7 @@ def build_command(config, args):
     guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
     mounts = [parse_mount(spec, args.force) for spec in args.mount]
     guard_overlays(mounts)
+    guard_bwrap_overlay(mounts)
     variables = [parse_env(spec) for spec in args.env]
 
     homes = Path(config["homes"]).expanduser()
@@ -368,9 +380,14 @@ def build_command(config, args):
                 else ["--", "bash", "-l"])
 
     if network == "private":
-        # Without --no-map-gw pasta maps the host onto the gateway address,
-        # which would put every loopback service back within reach.
-        command = ["pasta", "--config-net", "--no-map-gw", "--quiet", "--"] + command
+        # pasta forwards ports both ways unless told not to: a port bound on
+        # the host answers inside, and a port bound inside is bound on the
+        # host. --no-map-gw closes the third way in, the host behind the
+        # gateway address.
+        command = ["pasta", "--config-net", "--quiet",
+                   "--tcp-ports", "none", "--udp-ports", "none",
+                   "--tcp-ns", "none", "--udp-ns", "none",
+                   "--no-map-gw", "--"] + command
 
     return command
 

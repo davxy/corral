@@ -7,7 +7,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # 26.04 rather than latest: ':tmp' mounts need bubblewrap 0.11.0 or newer,
+    # and 24.04 ships 0.9.0.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
@@ -26,7 +28,7 @@ jobs:
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
       - name: Check that pasta can run
-        # Reported rather than required: the suite skips the three 'private'
+        # Reported rather than required: the suite skips the four 'private'
         # assertions when the runner has no /dev/net/tun, and a silent skip is
         # how a network regression would get through unnoticed.
         run: |
@@ -34,6 +36,14 @@ jobs:
           pasta --config-net --no-map-gw --quiet -- /bin/true \
             && echo "pasta works; the private-mode assertions will run" \
             || echo "::warning::pasta cannot run here; private-mode assertions will skip"
+
+      - name: Check that bwrap has the overlay options
+        # Reported rather than required, for the same reason as pasta: the
+        # suite skips the ':tmp' assertions on a bwrap without them.
+        run: |
+          bwrap --help | grep -q -- --tmp-overlay \
+            && echo "bwrap has --tmp-overlay; the ':tmp' assertions will run" \
+            || echo "::warning::bwrap has no --tmp-overlay; the ':tmp' assertions will skip"
 
       - name: Syntax check
         run: python3 -m py_compile corral
