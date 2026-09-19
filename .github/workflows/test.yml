@@ -13,10 +13,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install bubblewrap and passt
+      - name: Install bubblewrap, passt and pipx
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap passt
+          sudo apt-get install -y bubblewrap passt pipx
 
       - name: Allow unprivileged user namespaces
         # Ubuntu 23.10 and later ship an AppArmor policy that denies
@@ -50,3 +50,12 @@ jobs:
 
       - name: Run the property suite
         run: ./tests/corral-test
+
+      - name: Install with pipx and run the installed script
+        # Nothing else reads the pyproject.toml, so this is where a broken one
+        # shows. 'check' runs the installed script for real, and it fails only
+        # where the suite above has already failed.
+        run: |
+          pipx install .
+          ~/.local/bin/corral --help
+          ~/.local/bin/corral check

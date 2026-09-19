@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "corral"
+version = "0.1.0"
+description = "Run a shell with the current directory writable and the rest of the host read only"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Davide Galassi", email = "davxy@datawok.net" }]
+keywords = ["sandbox", "bubblewrap", "agent"]
+
+[project.urls]
+Repository = "https://github.com/davxy/corral"
+
+# The script is one file and stays one file, so it is installed as a script
+# rather than imported through an entry point.
+[tool.setuptools]
+packages = []
+script-files = ["corral"]

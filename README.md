@@ -45,6 +45,29 @@ rather than fall back to a weaker mode without a word. `:tmp` mounts need
 `bubblewrap` 0.11.0 or newer, which Ubuntu 24.04 does not have, and `corral`
 says so instead of leaving `bwrap` to fail on an unknown option.
 
+## Installing
+
+`corral` is one file with nothing beyond the standard library, so copying it
+onto the PATH is a complete installation:
+
+```
+install -Dm755 corral ~/.local/bin/corral
+```
+
+The `pyproject.toml` installs that same file through `pipx`, which keeps it
+in a Python of its own:
+
+```
+pipx install git+https://github.com/davxy/corral
+```
+
+On Arch, the `PKGBUILD` at the root builds a package from the release tag it
+names:
+
+```
+makepkg -si
+```
+
 ## Checking the host
 
 `corral check` reports each thing corral depends on, with a state and what to
