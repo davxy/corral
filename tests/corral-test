@@ -612,5 +612,94 @@ is 'an answer that needs escaping is read back too' "$answered" \
    "$(config_run --dry-run </dev/null | tail -1)"
 
 
+section 'lifecycle'
+
+# The homes root is the one place corral leaves state behind, and until now
+# the only way to see or reap it was a path to remember. 'list' has to show
+# every home and nothing that is not one: '.corral' holds the generated /etc
+# files, a name that could never be a user is not a home, and a link in the
+# root points somewhere the root does not own.
+mkdir -p "$TMP/homes/unused" "$TMP/homes/Not-a-home"
+ln -s "$PROJECT" "$TMP/homes/link"
+LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1); status=$?
+rows() { printf '%s\n' "$LIST_OUT" | awk 'NR > 1 { printf "%s ", $1 }' | sed 's/ $//'; }
+row()  { printf '%s\n' "$LIST_OUT" | awk -v user="$1" '$1 == user'; }
+is  'list succeeds' '0' "$status"
+is  'list names each home once, in order, and nothing else' 'corral other unused' "$(rows)"
+has 'a home that was never started says never' 'never' "$(row unused)"
+is  'a started home shows the date of its last start' 'dated' \
+    "$(row corral | awk '{ print $3 }' | grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' \
+       && echo dated || echo undated)"
+has 'a row ends with the path of the home' "$TMP/homes/unused" "$(row unused)"
+
+# The size is what the home costs on disk, which is what decides whether it
+# is worth removing.
+head -c 1048576 /dev/zero > "$TMP/homes/unused/blob"
+LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1)
+is 'the size counts what is inside' '1.0M' "$(row unused | awk '{ print $2 }')"
+
+EMPTYCFG="$TMP/empty-config"
+mkdir -p "$EMPTYCFG/corral" "$TMP/empty-homes"
+printf 'homes = "%s"\ntools = ""\ndefault_user = "corral"\nnetwork = "none"\n' \
+       "$TMP/empty-homes" > "$EMPTYCFG/corral/config.toml"
+has 'an empty root says so' 'No sandbox homes' \
+    "$(cd "$PROJECT" && XDG_CONFIG_HOME="$EMPTYCFG" "$CORRAL_BIN" list 2>&1 </dev/null)"
+corral_err "$PROJECT" list extra
+isnt 'list takes no argument' '0' "$PSTATUS"
+
+# 'remove' takes a user name and nothing else. A path, a name with a dot in
+# front and a link in the root would each reach outside the home it names,
+# and the check on the name is what stops the first two.
+corral_err "$PROJECT" remove
+isnt 'remove needs a name' '0' "$PSTATUS"
+corral_err "$PROJECT" remove ../project
+isnt 'remove refuses a path' '0' "$PSTATUS"
+is   'and the path is still there' 'there' "$([ -d "$PROJECT" ] && echo there || echo gone)"
+corral_err "$PROJECT" remove .corral
+isnt 'remove refuses the generated directory' '0' "$PSTATUS"
+is   'and it is still there' 'there' "$([ -d "$TMP/homes/.corral" ] && echo there || echo gone)"
+touch "$PROJECT/keep"
+printf 'y\n' | (cd "$PROJECT" && "$CORRAL_BIN" remove link >/dev/null 2>&1); status=$?
+isnt 'remove refuses a symbolic link, even when confirmed' '0' "$status"
+is   'and what it points to is untouched' 'there' \
+     "$([ -e "$PROJECT/keep" ] && echo there || echo gone)"
+corral_err "$PROJECT" remove nosuch
+isnt 'remove refuses a name that has no home' '0' "$PSTATUS"
+has  'the refusal names it' "no 'nosuch' sandbox" "$ERR_OUT"
+
+# A home holds agent state and credentials, so it goes only after a
+# confirmation that names the path, and no answer is the same as no.
+out=$(printf 'n\n' | (cd "$PROJECT" && "$CORRAL_BIN" remove other 2>&1)); status=$?
+isnt 'remove stops on no' '0' "$status"
+has  'the prompt names the path' "$TMP/homes/other" "$out"
+is   'and the home is still there' 'there' "$([ -d "$TMP/homes/other" ] && echo there || echo gone)"
+(cd "$PROJECT" && "$CORRAL_BIN" remove other </dev/null >/dev/null 2>&1); status=$?
+isnt 'remove stops without an answer' '0' "$status"
+is   'the generated /etc files exist before the removal' 'there' \
+     "$([ -d "$TMP/homes/.corral/other" ] && echo there || echo gone)"
+printf 'y\n' | (cd "$PROJECT" && "$CORRAL_BIN" remove other >/dev/null 2>&1); status=$?
+is   'remove goes ahead on yes' '0' "$status"
+is   'the home is gone' 'gone' "$([ -e "$TMP/homes/other" ] && echo there || echo gone)"
+is   'and so are its generated /etc files' 'gone' \
+     "$([ -e "$TMP/homes/.corral/other" ] && echo there || echo gone)"
+is   'the other homes are untouched' 'there' "$([ -d "$TMP/homes/corral" ] && echo there || echo gone)"
+LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1)
+is   'list no longer shows it' 'corral unused' "$(rows)"
+
+# The verbs are corral's own words and never something to run inside. A
+# program by one of those names still runs with '--' in front. Neither verb
+# means anything from inside a sandbox, where the homes root is not even
+# mounted, and neither needs bwrap, so a host without it can still clean up.
+corral_err "$PROJECT" --dry-run -- remove x
+is 'a leading -- sends a verb to the sandbox as a command' "bash -lc 'remove x'" "${ERR_OUT##*-- }"
+out=$(cd "$PROJECT" && CORRAL=1 CORRAL_USER=outer "$CORRAL_BIN" list 2>&1); status=$?
+isnt 'list is refused inside a sandbox' '0' "$status"
+has  'and the refusal says so' 'already inside' "$out"
+mkdir -p "$TMP/nobwrap"
+ln -s "$(command -v python3)" "$TMP/nobwrap/python3"
+is 'list works without bwrap on PATH' 'corral unused' \
+   "$(LIST_OUT=$(cd "$PROJECT" && PATH="$TMP/nobwrap" "$CORRAL_BIN" list 2>&1); rows)"
+
+
 printf '\n%d passed, %d failed, %d skipped\n' "$passed" "$failed" "$skipped"
 [ "$failed" -eq 0 ]

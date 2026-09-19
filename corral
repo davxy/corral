@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tomllib
+from datetime import datetime
 from pathlib import Path
 
 CWD = Path.cwd().resolve()
@@ -163,6 +164,11 @@ def guard_bwrap_overlay(mounts):
         raise SystemExit("':tmp' needs bwrap 0.11.0 or newer; this one has no --tmp-overlay.")
 
 
+def generated_dir(homes, username):
+    # A leading dot is not a legal username, so this cannot collide with one.
+    return homes / ".corral" / username
+
+
 def generated_etc(directory, username):
     """The /etc files that have to describe the sandbox rather than the host.
 
@@ -262,8 +268,7 @@ def build_command(config, project, args):
         home.mkdir(parents=True)
     seed_home(home)
 
-    # A leading dot is not a legal username, so this cannot collide with one.
-    generated = homes / ".corral" / username
+    generated = generated_dir(homes, username)
     generated.mkdir(parents=True, exist_ok=True)
     guest_home = Path("/home") / username
 
@@ -401,6 +406,84 @@ def build_command(config, project, args):
     return command
 
 
+def disk_usage(root):
+    """Blocks rather than sizes, so the number agrees with du."""
+    total = root.lstat().st_blocks * 512
+    for directory, subdirectories, files in os.walk(root):
+        for name in subdirectories + files:
+            total += (Path(directory) / name).lstat().st_blocks * 512
+    return total
+
+
+def format_size(size):
+    unit = "B"
+    for larger in ("K", "M", "G", "T"):
+        if size < 1024:
+            break
+        size /= 1024
+        unit = larger
+    if unit == "B":
+        return f"{size}B"
+    return f"{size:.1f}{unit}" if size < 10 else f"{size:.0f}{unit}"
+
+
+def last_used(homes, username):
+    """The generated passwd is rewritten at every start, so its mtime is the
+    last start without a marker file to keep."""
+    stamp = generated_dir(homes, username) / "passwd"
+    if not stamp.exists():
+        return "never"
+    return datetime.fromtimestamp(stamp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+
+def sandbox_homes(homes):
+    """A home is a directory in the root whose name could be a sandbox user.
+
+    That leaves out the generated '.corral' directory, and it leaves out a
+    symbolic link, which points somewhere the root does not own.
+    """
+    return sorted(entry.name for entry in homes.iterdir()
+                  if USERNAME_RE.match(entry.name) and entry.is_dir() and not entry.is_symlink())
+
+
+def list_homes(rest):
+    argparse.ArgumentParser(prog="corral list",
+                            description="List the sandbox homes.").parse_args(rest)
+    homes = Path(load_config()["homes"]).expanduser()
+    names = sandbox_homes(homes)
+    if not names:
+        print(f"No sandbox homes under '{homes}'.")
+        return
+    width = max(len(name) for name in names + ["USER"])
+    print(f"{'USER':<{width}}  {'SIZE':>5}  {'LAST USED':<16}  HOME")
+    for name in names:
+        home = homes / name
+        print(f"{name:<{width}}  {format_size(disk_usage(home)):>5}  "
+              f"{last_used(homes, name):<16}  {home}")
+
+
+def remove_home(rest):
+    parser = argparse.ArgumentParser(prog="corral remove",
+                                     description="Delete a sandbox user's home.")
+    parser.add_argument("user", help="the sandbox user whose home to delete")
+    username = parser.parse_args(rest).user
+    if not USERNAME_RE.match(username):
+        raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
+    homes = Path(load_config()["homes"]).expanduser()
+    home = homes / username
+    if home.is_symlink():
+        raise SystemExit(f"refusing to remove '{home}': it is a symbolic link")
+    if not home.is_dir():
+        raise SystemExit(f"there is no '{username}' sandbox under '{homes}'")
+    if not ask_confirmation(f"Remove '{home}' ({format_size(disk_usage(home))})?"):
+        raise SystemExit("Aborted.")
+    shutil.rmtree(home)
+    generated = generated_dir(homes, username)
+    if generated.is_dir():
+        shutil.rmtree(generated)
+    print(f"Removed '{home}'.")
+
+
 def read_table(path, label):
     try:
         return tomllib.loads(path.read_text())
@@ -497,11 +580,15 @@ def main():
         prog="corral",
         # Spelled out because argparse renders a trailing REMAINDER as a bare
         # '...' on a line of its own, which names nothing.
-        usage="corral [OPTION ...] [COMMAND [ARG ...]]",
+        usage="corral [OPTION ...] [COMMAND [ARG ...]]\n"
+              "       corral list\n"
+              "       corral remove USER",
         description="Run a shell with the current directory writable and the rest of "
                     "the host read only.",
-        epilog=f"Settings live in '{CONFIG_PATH}' and are asked for when missing. "
-               f"A '{PROJECT_FILE}' in the working directory adds flags for that project.",
+        epilog=f"'list' shows the sandbox homes and 'remove' deletes one; put '--' first "
+               f"to run a program by one of those names. Settings live in '{CONFIG_PATH}' "
+               f"and are asked for when missing. A '{PROJECT_FILE}' in the working "
+               f"directory adds flags for that project.",
     )
     parser.add_argument("-u", "--user", help="sandbox user to run as")
     parser.add_argument("-m", "--mount", action="append", default=[],
@@ -519,12 +606,6 @@ def main():
                              "after it belongs to it")
     args = parser.parse_args()
 
-    # REMAINDER hands the separator over with the rest, so '--' would arrive as
-    # the program to run. Only the first one is corral's; a later one is the
-    # command's own.
-    if args.command[:1] == ["--"]:
-        del args.command[0]
-
     if os.environ.get("CORRAL"):
         # Nesting mostly works, and what it produces is never what was meant:
         # the inner sandbox is built from this one's read-only rootfs and
@@ -532,6 +613,17 @@ def main():
         inner = os.environ.get("CORRAL_USER") or "?"
         raise SystemExit(f"already inside the '{inner}' sandbox.\n"
                          f"Exit first, or run 'env -u CORRAL corral' to nest deliberately.")
+
+    # REMAINDER hands the separator over with the rest, so '--' would arrive as
+    # the program to run. Only the first one is corral's; a later one is the
+    # command's own. It also makes a 'list' or 'remove' after it a program to
+    # run rather than corral's own verb.
+    verbs = {"list": list_homes, "remove": remove_home}
+    if args.command[:1] == ["--"]:
+        del args.command[0]
+    elif args.command and args.command[0] in verbs:
+        verbs[args.command[0]](args.command[1:])
+        return
 
     if not shutil.which("bwrap"):
         raise SystemExit("bwrap was not found on PATH; is bubblewrap installed?")

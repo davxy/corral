@@ -19,6 +19,8 @@ corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
 corral --dry-run          # print the bwrap command and exit
 corral claude             # run a tool directly instead of the shell
+corral list               # the sandbox homes, their size and last start
+corral remove NAME        # delete one, after a confirmation
 corral --help
 ```
 
@@ -118,6 +120,38 @@ answer, or agent state lands in a directory that was never mounted.
 The separation is the home, and only the home. Every sandbox user runs under
 your own host uid, so this is a way to keep configurations, credentials and
 agent state apart. It is not a privilege boundary between them.
+
+## Listing and removing sandboxes
+
+`corral list` shows every sandbox home under `homes`: what it takes on disk,
+when it was last started, and where it is.
+
+```
+$ corral list
+USER     SIZE  LAST USED         HOME
+corral   1.2G  2026-09-19 08:39  /home/you/.local/share/corral/homes/corral
+review     0B  never             /home/you/.local/share/corral/homes/review
+rust     334M  2026-09-12 17:02  /home/you/.local/share/corral/homes/rust
+```
+
+The time is that of the last start. corral rewrites the generated `passwd`
+at every start, and what is shown is that file's modification time, so there
+is no marker to keep and a home made by hand shows `never`.
+
+`corral remove NAME` deletes one home, and the generated files with it, after
+a confirmation that names the path and the size. It takes a user name, not a
+path. A name that could not be a sandbox user is refused before anything is
+looked at, which keeps `..`, `.corral` and an absolute path out. A symbolic
+link in the root is refused as well, since what it points to is not the
+root's to delete. `list` leaves both out for the same reason.
+
+Both are corral's own words and never reach the sandbox. A program by one of
+those names runs with `--` in front, like any command that starts with a
+dash:
+
+```
+corral -- remove build
+```
 
 ## The working directory
 
@@ -433,8 +467,9 @@ corral claude --resume     # --resume goes to claude
 corral --resume claude     # error: corral has no --resume
 ```
 
-A command that starts with a dash needs `--` in front of it. That first `--`
-is corral's; a second one belongs to the command:
+A command that starts with a dash needs `--` in front of it, and so does a
+program called `list` or `remove`, since those are corral's own verbs. That
+first `--` is corral's; a second one belongs to the command:
 
 ```
 corral -- ./-weird-name
@@ -530,15 +565,16 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 145 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 176 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
-that empties it, and that a `.corral.toml` adds what it says and no more.
+that empties it, that a `.corral.toml` adds what it says and no more, and that
+`list` and `remove` see real homes and nothing else.
 
 ```
 $ ./tests/corral-test
 ...
-141 passed, 0 failed, 4 skipped
+172 passed, 0 failed, 4 skipped
 ```
 
 It needs no configuration: it writes its own `config.toml` under a temporary
