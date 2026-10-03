@@ -47,7 +47,7 @@ pipx install git+https://github.com/davxy/corral
 makepkg -si                              # Arch, from the PKGBUILD
 ```
 
-On a new machine, run `corral check` first. It reads no config:
+On a new machine, run `corral check` first:
 
 ```
 $ corral check
@@ -60,35 +60,25 @@ dev.tty.legacy_tiocsti                        ok    0, and the seccomp filter of
 pasta                                         ok    pasta 2026_07_28.f8df3f1
 ```
 
-The `user namespace` line is the result. It runs `bwrap` with the namespace
-flags of corral, and shows the error of `bwrap` when it fails. The three
-sysctls are the usual causes. Ubuntu 23.10 and later set the first to 1. corral
-prints the `sysctl -w` fix only when the probe fails, because an AppArmor
-profile can let `bwrap` through while the sysctl is 1. A missing `pasta` is a
-warning, because `-n host` and `-n none` still work. The
-`dev.tty.legacy_tiocsti` line warns when the kernel allows `TIOCSTI` and corral
-has no filter for the machine, see [The terminal](#the-terminal). The exit
-status is 1 when a line says `FAIL`.
+`user namespace` is the result that matters. When it fails, the sysctl lines
+show the usual cause and the fix. Ubuntu 23.10 and later block user
+namespaces with AppArmor. The exit status is 1 when a line says `FAIL`.
 
 ## Configuration
 
 The config is `~/.config/corral/config.toml`, or the same path under
-`$XDG_CONFIG_HOME`. [`config.example.toml`](config.example.toml) shows every
-key.
+`$XDG_CONFIG_HOME`. The file and each key are optional.
+[`config.example.toml`](config.example.toml) shows every key.
 
 | key | meaning |
 |-----|---------|
 | `homes` | host directory with one `$HOME` per sandbox user, default `~/.local/share/corral/homes` |
-| `default_user` | user when `-u` is not given |
-| `network` | `private`, `host` or `none`, see [Networking](#networking) |
+| `default_user` | user when `-u` is not given, default `corral` |
+| `network` | `private` (default), `host` or `none`, see [Networking](#networking) |
 | `mounts` | mounts for every sandbox, same syntax as `-m` |
 | `env` | variables for every sandbox, same syntax as `-e` |
 | `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
 | `shell` | interactive shell, default `$SHELL`, see [Running a command](#running-a-command) |
-
-The file is optional. Without it, or without a key, corral uses the defaults:
-`~/.local/share/corral/homes`, the user `corral` and the network `private`.
-corral never writes the file.
 
 A value can contain `$(command)`, `$NAME` and `${NAME}`, so the file can name
 a secret without the secret in it:
@@ -97,28 +87,23 @@ a secret without the secret in it:
 env = ["GH_TOKEN=$(pass github/token)", "DATA=$HOME/datasets"]
 ```
 
-The commands run on the host with `sh -c`, at every start and also for `list`
-and `remove`. They use your terminal for stdin and stderr, so `pass` can ask
-for the passphrase. Trailing newlines are removed. A failed command or an unset
-variable stops the run. `$$` is a literal `$`. The parentheses in a command
-must balance.
+The commands run on the host with `sh -c` at every start, with your terminal
+as stdin, so `pass` can ask for the passphrase. A failed command or an unset
+variable stops the run. `$$` is a literal `$`.
 
-A host path under `mounts` must be absolute or start with `~`. `--force` does
-not apply to these mounts. Every start prints the config mounts and variables
-on stderr, because a mount that stays from run to run is easy to forget:
+A host path under `mounts` must be absolute or start with `~`, and `--force`
+does not apply to it. Every start prints the config mounts and variables on
+stderr, as written, not expanded. A literal `NAME=VALUE` shows its value:
 
 ```
 $ corral
-/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -m /srv/cache:/cache:rw -e RUST_LOG=debug
+/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -e RUST_LOG=debug
 ```
-
-This line shows the text as written and not the expanded value. A `$(pass ...)` entry does not show the secret, but a
-literal `NAME=VALUE` entry does.
 
 ## The project file
 
 A `.corral.toml` in the working directory holds the `-n`, `-u`, `-m` and `-e`
-values that a project always needs. It uses the same syntax:
+values that a project always needs:
 
 ```toml
 network = "host"
@@ -127,125 +112,73 @@ mounts = ["../core", "/data/fixtures:/data:ro"]
 env = ["RUST_LOG=debug"]
 ```
 
-A relative mount path resolves against the project directory. A bare name under
-`env` forwards the host value.
-
 The order is config, then project file, then flags. `-n` and `-u` replace the
 earlier value. Mounts and variables add up, and a later entry for the same
-target or name replaces the earlier one.
+target or name wins.
 
-The file comes with a repository, so corral trusts it less than the config:
-
-- It expands nothing, so a `$(command)` in it does not run.
-- corral does not look in parent directories.
-- `--force` does not apply to its mounts, and a `force` key is refused.
-
-Every start prints what the file added:
+The file comes with a repository, so corral trusts it less than the config. It
+expands nothing, `--force` does not apply to it, and corral does not look for
+it in parent directories. Every start prints what it added:
 
 ```
 $ corral
 .corral.toml: -n host -u myproject -m ../core -m /data/fixtures:/data:ro -e RUST_LOG=debug
 ```
 
-For a repository that you did not write, read this line or the file. corral
-refuses only `$HOME` and `/`, so a file that mounts
-`/run/user/1000/gnupg/S.gpg-agent.ssh` is accepted.
+Read this line for a repository that you did not write. A project file can
+mount any path except `$HOME`, `/` and the parents of hidden directories.
 
 ## Sandbox users
 
-`-u NAME` binds `<homes>/NAME` at `/home/NAME`. corral creates a missing home,
-says so on stderr, and fills a new home from `/etc/skel`. `corral remove NAME`
-deletes a home that a typo made. The name must match
-`^[a-z_][a-z0-9_-]{0,31}$`.
+`-u NAME` binds `<homes>/NAME` at `/home/NAME`. corral creates a missing home
+from `/etc/skel`. A generated `passwd` gives the sandbox user, so `$HOME` and
+`getpwuid()` agree. No host account is created.
 
-No host account is created. corral writes a `passwd` file with the sandbox user
-and binds it over `/etc/passwd`, so `$HOME` and `getpwuid()` give the same
-home.
-
-All sandbox users run under your host uid. They keep configuration, credentials
-and agent state apart. They are not a privilege boundary.
+The sandbox users keep configuration, credentials and agent state apart. They
+all run under your uid, so they are not a privilege boundary.
 
 ```
 $ corral list
 USER     SIZE  LAST USED         HOME
 corral   1.2G  2026-09-19 08:39  /home/you/.local/share/corral/homes/corral
 review     0B  never             /home/you/.local/share/corral/homes/review
-rust     334M  2026-09-12 17:02  /home/you/.local/share/corral/homes/rust
 ```
 
-`LAST USED` is the modification time of the generated `passwd`, which corral
-writes at every start. A home made by hand shows `never`.
-
-`corral remove NAME` deletes a home and its generated files, after a
-confirmation that shows the path and the size. It takes a user name, not a
-path. It refuses a name that is not a valid user name and a symbolic link in
-`homes`. `list` does not show them.
-
-To run a program called `list`, `remove` or `check`, put `--` before it.
+`corral remove NAME` deletes a home after a confirmation. To run a program
+called `list`, `remove` or `check`, put `--` before it.
 
 ## Filesystem
 
-The project directory has the same path inside as on the host
-(`--bind "$PWD" "$PWD"`). Build output and tool state keep absolute paths:
-cargo dep files, `compile_commands.json`, ccache, LSP indexes, agent sessions
-keyed by directory. With one path, you can use them from both sides. corral
-refuses `$HOME` and `/` as the project directory or as a mount source, unless
-you give `--force`.
+The project directory has the same path inside as on the host, so absolute
+paths in build output, LSP indexes and agent sessions work on both sides.
+corral refuses `$HOME` and `/` as the project or as a mount source, unless you
+give `--force`.
 
-These are the only writable paths:
+Writable:
 
-- The project directory, unless you give `-m .::ro`. The writes go to the host.
-- `/home/<user>`, which is `<homes>/<user>` on the host.
-- `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR`. They are new tmpfs mounts, and
-  their contents go at exit.
+- the project directory, unless you give `-m .::ro`;
+- `/home/<user>`, which is `<homes>/<user>` on the host;
+- `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR`, which are empty and go at exit.
 
-A write anywhere else fails:
+A write anywhere else fails with `Read-only file system`.
 
-```
-$ touch /usr/local/bin/pwned
-touch: cannot touch '/usr/local/bin/pwned': Read-only file system
-```
+Hidden:
 
-This includes the tmpfs mount points that corral makes to hold a bind, such as
-`/home/you` above a project at `/home/you/work/project`. A write in the wrong
-place fails, and does not disappear at exit without a sign. For a writable
-layer that disappears, use [`:tmp`](#tmp-mounts) on one directory.
-
-These are hidden:
-
-- `/home` is a tmpfs. It contains the sandbox home and the path down to the
-  project, and nothing more. A symbolic link out of the project resolves in
-  the sandbox, where the target is missing. Your real home also gets a tmpfs
-  when it is not under `/home`, for example `/root`. Your home holds your
-  credentials: ssh and gpg keys, tokens in `~/.config`, `~/.aws` and
-  `~/.netrc`, browser profiles. A read-only bind stops writes, not reads, and
-  `private` mode lets outbound traffic go. Without the tmpfs, an agent can
-  read them and send them out. A tool in the sandbox also finds its config
-  in the sandbox home, and not in yours by an absolute path. The homes of
-  other users under `/home` can also be readable. To give the sandbox one thing from
-  your home, use `-m`, for example `-m ~/notes`.
-- Each directory under the `hide` key is a tmpfs in the same way. With
-  `hide = ["/mnt/ssd/develop"]`, a project in `/mnt/ssd/develop/app` does not
-  see the other projects next to it. The project and the `-m` mounts under a
-  hidden directory are bound back on top. corral refuses a mount, or a start,
-  in a parent of a hidden directory, because it would show the directory
-  again. `--force` lifts this for the start directory and for `-m`, but not
-  for the config or a project file.
-- `$XDG_RUNTIME_DIR` is a tmpfs. A read-only bind does not stop `connect()` on
-  a unix socket, so without the tmpfs the sandbox can use the host ssh and gpg
-  agents, and sign and push as you.
-- `/run/docker.sock`, `/run/containerd/containerd.sock`,
-  `/run/podman/podman.sock`, `/run/libvirt/libvirt-sock` and
-  `/run/pcscd/pcscd.comm` are covered with `/dev/null`. These daemons act as
-  root for any process that can connect, and the sandbox keeps your groups. A
-  user in the `docker` group gets root on the host with
-  `docker run -v /:/host`. The `hide` key adds more files. A mount of a
-  directory that holds one of them gets the `/dev/null` too, so `-m /run` does
-  not show the socket again. corral skips a file that you can neither read nor
-  write.
-- `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_CONFIG_HOME`,
-  `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` are unset. `PATH`
-  entries under your real home are removed.
+- `/home`, and your real home where it is not under `/home`. They hold your
+  ssh and gpg keys and the tokens of your tools. Read-only is not enough,
+  because an agent can read them and send them out. Only the sandbox home and
+  the path down to the project are left.
+- Each directory under the `hide` key, in the same way. With
+  `hide = ["/mnt/ssd/develop"]`, a project there does not see the projects
+  next to it. corral refuses a mount or a start in a parent of a hidden
+  directory, because that shows it again. `--force` lifts this for `-m` and
+  the start directory.
+- `$XDG_RUNTIME_DIR`, which holds the sockets of the ssh and gpg agents.
+- The sockets of Docker, containerd, podman, libvirt and pcscd, and the files
+  under the `hide` key. corral covers them with `/dev/null`. Access to the
+  Docker socket is root on the host.
+- `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and the `XDG_*_HOME` variables.
+  `PATH` entries under your real home.
 
 To give the host ssh agent to the sandbox:
 
@@ -253,104 +186,76 @@ To give the host ssh agent to the sandbox:
 corral -m /run/user/1000/gnupg/S.gpg-agent.ssh -e SSH_AUTH_SOCK
 ```
 
-`PATH` starts with `/home/<user>/.local/bin:/home/<user>/.cargo/bin`, so a tool
-in the sandbox home comes before the host copy. All other software comes from
-the host rootfs. There is no image to pin or rebuild.
+`PATH` starts with `~/.local/bin` and `~/.cargo/bin` of the sandbox home. All
+other software comes from the host.
 
 ## Extra mounts
 
 ```
 corral -m ../core                  # read only, same path inside
 corral -m /data/sets:/data:rw      # writable, at a chosen path
-corral -m ../core -m ../docs       # repeatable
 corral -m ~/notes:~/notes:rw       # into the sandbox home
+corral -m ./vendor::ro             # one directory of the project read only
 ```
 
-The syntax is `HOST[:GUEST[:MODE]]`. GUEST is the host path when not given, so
-a relative path such as a cargo path dependency on `../core` still resolves. A
-given GUEST must be absolute or start with `~`. MODE is `ro` (default), `rw` or
-`tmp`. The source must exist.
+The syntax is `HOST[:GUEST[:MODE]]`, and `-m` is repeatable. GUEST is the host
+path when not given. MODE is `ro` (default), `rw` or `tmp`. In HOST, `~` is
+your home. In GUEST, `~` is the sandbox home.
 
-In HOST, `~` is your home. In GUEST, `~` is the sandbox home, so one mount fits
-all sandbox users. `~name` is refused in GUEST.
-
-When the mount point is missing:
-
-- Under `~`, corral creates it in the sandbox home on the host. It stays there
-  after exit.
-- Inside the project, `bwrap` creates it in the project on the host.
-- Elsewhere, corral replaces the parent with a read-only tmpfs and binds the
-  real entries of the parent back. The parent must exist: `-m src:/srv/data`
-  works when `/srv` exists, `-m src:/a/b/c` fails when `/a` does not.
-
-corral makes these mount points before its own mounts, so `-m src:/data`, which
-replaces `/`, does not remove the `/home` tmpfs.
-
-A mount inside the project goes after the project bind. `-m .::ro` makes the
-whole project read only, and `-m ./vendor::ro` one directory. A project file
-can ask for `mounts = [".::ro"]`.
+A missing mount point is created. In the project and the sandbox home, it stays
+on the host after exit. Elsewhere, its parent must exist on the host.
 
 ## `:tmp` mounts
 
 ```
 corral -m ./vendor/sdk::tmp ./configure
-corral -m /data/fixtures:/data:tmp
+corral -m .::tmp                   # the whole project as a throwaway copy
 ```
 
-The host path is the read-only lower layer of an overlay, and a tmpfs above it
-gets the writes. The program can write and read back. The host does not
-change, and the writes go at exit. They use RAM.
+The host path becomes the lower layer of an overlay. The sandbox can write,
+the host does not change, and the writes go at exit. They use RAM. Limits from
+overlayfs:
 
-The limits come from overlayfs:
-
-- Only your own files can change. A copy-up keeps the owner of the original,
-  and the sandbox maps only your uid, so a write to a root-owned file fails
-  with `Permission denied`. An overlay on a root-owned tree takes new entries
-  at its top level and nothing deeper. `corral -m /usr::tmp make install` does
-  not work.
-- The source must not contain a mount point. corral reads
-  `/proc/self/mountinfo` and names it. On a host with a separate `/var/log`
-  mount, `/var` cannot be a `:tmp` source.
-- Two `:tmp` sources must not nest. The kernel accepts this but the result is
-  not defined, so corral refuses it.
-
-The overlays go after every bind and before the generated `/etc/passwd`. Thus
-the project bind does not cover an overlay inside the project, and
-`-m /etc::tmp` does not cover the generated `passwd`.
-
-`-m .::tmp` makes the whole project a temporary copy. A build script can write
-and finish, and the checkout does not change.
+- Only your own files can change. `corral -m /usr::tmp make install` fails.
+- The source must not contain a mount point, and two sources must not nest.
+  corral refuses both.
 
 ## Environment variables
 
 ```
 corral -e RUST_LOG=debug    # explicit value
-corral -e GITHUB_TOKEN      # forward the host's value
-corral -e A=1 -e B=2        # repeatable
+corral -e GITHUB_TOKEN      # forward the host's value, an error if unset
 ```
 
-To forward a name that the host does not have is an error, because an empty
-variable and a missing one look the same inside.
-
-corral sets three variables:
+corral sets:
 
 | variable | value |
 |----------|-------|
 | `CORRAL` | `1` |
 | `CORRAL_USER` | the sandbox user name |
-| `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | `1`, because the alternate screen has no scrollback. `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` removes it. |
+| `SHELL` | the interactive shell |
+| `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | `1`, for scrollback. `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` removes it. |
 
-Use `CORRAL` to know that you are in a sandbox. `USER`, `$HOME`, the hostname
-and the uid do not tell you.
+Use `CORRAL` to know that you are in a sandbox:
 
 ```sh
 [ -n "$CORRAL" ] || { echo "refusing to run outside corral" >&2; exit 1; }
 PS1="(${CORRAL_USER}) ${PS1}"   # in the sandbox .bashrc
 ```
 
-corral does not start inside a sandbox. `env -u CORRAL corral` starts it
-anyway, but the inner sandbox sees only the read-only rootfs and the empty
-`/home` of the outer one.
+Claude Code hides the prompt. To show the sandbox in its status line, put this
+in `~/.claude/settings.json` of the sandbox home:
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "[ -n \"$CORRAL\" ] && echo \"corral: $CORRAL_USER\""
+  }
+}
+```
+
+corral refuses to start inside a sandbox. `env -u CORRAL corral` forces it.
 
 ## Networking
 
@@ -360,18 +265,12 @@ anyway, but the inner sandbox sees only the read-only rootfs and the empty
 | `host` | reachable | reachable | yes |
 | `none` | unreachable | unreachable | no |
 
-`private` is the default. The sandbox gets its own network namespace, with
-`pasta` as a userspace network stack. Outbound traffic works. Services on the
-host `127.0.0.1` do not answer, and two sandboxes do not compete for host
-ports. corral starts `pasta` with port forwarding off in both directions and
-with `--no-map-gw`. Each of the `pasta` defaults makes the host loopback
-reachable again. Do not remove these flags.
+`private` gives the sandbox its own network stack with `pasta`. corral turns
+off the port forwarding of `pasta` and its map of the host gateway, because
+each of them makes the host loopback reachable.
 
-`host` shares the network namespace of the host. Use it to reach a service on
-the host loopback, or to let the host reach the sandbox.
-
-`none` has no network. Name lookups can still answer through the unix socket
-of the host resolver, but no traffic goes out.
+`host` shares the network of the host. Use it to reach a service on the host
+loopback, or to let the host reach the sandbox.
 
 `-n` overrides the config and the project file.
 
@@ -379,49 +278,27 @@ of the host resolver, but no traffic goes out.
 
 ```
 corral claude
-corral cargo test
-corral -u throwaway opencode
 corral claude --resume          # --resume goes to claude
+corral -u throwaway opencode
 corral -- ./-weird-name
-corral cargo test -- --nocapture
 ```
 
-The command starts at the first argument that is not a corral option. Put `--`
-before a command that starts with a dash. The command runs in `bash -lc`,
-and its exit status is the exit status of corral.
+The command starts at the first argument that is not a corral option. It runs
+in `bash -lc`, and its exit status is the exit status of corral.
 
-Without a command, corral starts the `shell` key of the config as a login
-shell. Without the key, it starts `$SHELL`, or `/bin/bash` when the sandbox
-cannot run `$SHELL`, for example a shell under your hidden home. The generated
-`passwd` and `SHELL` name the same shell. A command uses bash with any shell:
-the command is quoted for a POSIX shell, and fish reads a backslash in quotes
-in another way. Your shell setup is in your real home, so a new sandbox home
-does not have it. Mount it, for example `-m ~/.config/fish:~/.config/fish`.
+Without a command, corral starts the `shell` key, else `$SHELL`, else
+`/bin/bash`, as a login shell. Your shell setup is in your hidden home, so
+mount it, for example `-m ~/.config/fish:~/.config/fish`.
 
-## Uid and capabilities
+## Uid, capabilities and the terminal
 
-The sandbox runs as your host uid and gid in every network mode, under the
-name of the sandbox user. Host files that root owns show as `nobody`.
+The sandbox runs as your uid and gid, with no capabilities, also when you
+start corral as root. Host files that root owns show as `nobody`.
 
-The sandbox has no capabilities, also when you start corral as root. bwrap
-makes the read-only binds and the tmpfs mounts in the user namespace of the
-sandbox. A capability in that namespace is enough to unmount them or to make
-them writable.
-
-## The terminal
-
-The sandbox shares your terminal. The `TIOCSTI` ioctl pushes characters into
-the input of a terminal, so a process in the sandbox could type a command
-that the shell which started corral runs after corral exits. The kernel
-allows it where `dev.tty.legacy_tiocsti` is 1, and always before Linux 6.2.
-`TIOCLINUX` can paste the selection of a text console in the same way.
-
-corral gives bwrap a seccomp filter that refuses both with `EPERM`, as Flatpak
-does. The filter covers x86_64 with its 32-bit and x32 programs, aarch64 with
-32-bit ARM, and riscv64. On other machines there is no filter, and
-`corral check` warns when the kernel allows `TIOCSTI`. The filter is in
-`<homes>/.corral/<user>/seccomp.bpf`. pasta closes the file descriptors that it
-gets, so a `sh -c` step opens the file after pasta, just before bwrap.
+A seccomp filter refuses the `TIOCSTI` and `TIOCLINUX` ioctls. Without it, a
+process in the sandbox could type a command into the shell that started
+corral. The filter covers x86_64, aarch64 and riscv64. Elsewhere,
+`corral check` warns when the kernel allows `TIOCSTI`.
 
 ## Limits
 
@@ -431,16 +308,13 @@ boundary against hostile code.
 - The start directory is fully writable. A start in `~/work` gives all of
   `~/work`.
 - `private` and `host` have full outbound access, the LAN included.
-- `-n host` reaches a daemon that listens on a TCP port of the host loopback,
-  for example `dockerd -H tcp://127.0.0.1:2375`. The hidden sockets do not
-  stop that.
+- `-n host` reaches a daemon on a TCP port of the host loopback, for example
+  `dockerd -H tcp://127.0.0.1:2375`.
 - Anything in a sandbox can use the credentials in its home. After
   `gh auth login`, an agent can push and read private repositories.
-- Sandbox users share your uid.
+- `none` still resolves names through the unix socket of the host resolver.
 - The hostname `corral` does not resolve when `nsswitch.conf` puts `resolve`
-  before `files`. Tools that look up their own hostname can warn.
-
-The PID and IPC namespaces are not shared with the host.
+  before `files`. Some tools warn.
 
 ## Tests
 
@@ -448,20 +322,12 @@ The PID and IPC namespaces are not shared with the host.
 $ ./tests/corral-test
 ```
 
-The suite needs `bwrap` and no config. It writes its own `config.toml` under a
-temporary `XDG_CONFIG_HOME`. It also uses a temporary directory in `$TMPDIR`,
-one under `$HOME`, because a project below `/home` is one of the tested
-cases, and one next to `corral`, for the hidden directories. It removes all
-of them at exit.
+The suite needs `bwrap` and no config. It removes its temporary files at exit.
+The `private` tests skip when `pasta` cannot run, for example inside corral,
+and the `:tmp` tests skip with `bwrap` older than 0.11.0.
 
-The `private` tests skip when `pasta` cannot run, for example in a corral
-sandbox without `/dev/net/tun`. The `:tmp` tests skip with `bwrap` older than
-0.11.0. The output shows the skips apart from the passes.
-
-CI uses `ubuntu-26.04`, because `ubuntu-latest` is 24.04 with `bubblewrap`
-0.9.0. The workflow sets the AppArmor user namespace sysctl to 0 first. On a
-recent Ubuntu workstation, corral can fail for the same reason, and
-`corral check` names it.
+CI uses `ubuntu-26.04`, because `ubuntu-latest` has `bubblewrap` 0.9.0, and
+sets the AppArmor user namespace sysctl to 0 first.
 
 ## License
 
