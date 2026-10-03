@@ -540,6 +540,7 @@ def build_command(config, project, args):
         # to test. It doubles as the guard against nesting; see main().
         "--setenv", "CORRAL", "1",
         "--setenv", "CORRAL_USER", username,
+        "--setenv", "CORRAL_PROJECT", str(CWD),
         # claude renders in the alternate screen otherwise, which terminals
         # keep no scrollback for.
         "--setenv", "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN", "1",

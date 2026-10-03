@@ -233,6 +233,7 @@ corral sets:
 |----------|-------|
 | `CORRAL` | `1` |
 | `CORRAL_USER` | the sandbox user name |
+| `CORRAL_PROJECT` | the start directory, so `cd "$CORRAL_PROJECT"` goes back to it |
 | `SHELL` | the interactive shell |
 | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | `1`, for scrollback. `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` removes it. |
 

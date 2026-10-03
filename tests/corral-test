@@ -106,6 +106,14 @@ is 'CORRAL_USER names the sandbox user' 'corral' \
    "$(probe "$PROJECT" 'echo "${CORRAL_USER:-unset}"')"
 is 'CORRAL_USER follows --user' 'other' \
    "$(probe "$PROJECT" 'echo "${CORRAL_USER:-unset}"' -u other)"
+# The start directory, to get back to it after a cd. Links are resolved,
+# because that is the path that corral binds.
+ln -sfn "$PROJECT" "$TMP/project-link"
+real_project=$(cd "$PROJECT" && pwd -P)
+is 'CORRAL_PROJECT names the start directory' "$real_project" \
+   "$(probe "$PROJECT" 'cd / && echo "${CORRAL_PROJECT:-unset}"')"
+is 'CORRAL_PROJECT has the links resolved' "$real_project" \
+   "$(probe "$TMP/project-link" 'echo "${CORRAL_PROJECT:-unset}"')"
 is 'HOME is the sandbox home' '/home/corral' "$(probe "$PROJECT" 'echo "$HOME"')"
 is 'USER is the sandbox user' 'corral' "$(probe "$PROJECT" 'echo "$USER"')"
 is 'getpwuid agrees with HOME' '/home/corral' \
