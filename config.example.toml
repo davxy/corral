@@ -1,0 +1,20 @@
+# Copy to ~/.config/corral/config.toml (or $XDG_CONFIG_HOME/corral/config.toml).
+# corral asks for every key except 'mounts' when it is missing.
+
+# Host directory that holds one $HOME per sandbox user.
+homes = "~/.local/share/corral/homes"
+
+# User to run as when --user is not given.
+default_user = "corral"
+
+# "private", "host" or "none".
+network = "private"
+
+# Mounts for every sandbox, as HOST[:GUEST[:ro|rw|tmp]], the same as -m.
+# HOST must be absolute or start with '~'. GUEST defaults to HOST, and the
+# mode defaults to "ro". Every start prints these on stderr.
+mounts = [
+    "~/datasets:/data:ro",
+    "/srv/cache:/cache:rw",
+    "/etc/ssl::tmp",
+]

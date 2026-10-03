@@ -605,6 +605,17 @@ has 'a fresh run writes the answers as TOML' "homes = \"$TMP/homes\"" \
 is  'the next run reads them back and asks nothing' "$answered" \
     "$(config_run --dry-run </dev/null | tail -1)"
 
+# The example is documentation that nothing else checks, so it drifts the day a
+# key is added. Every key corral asks for has to be in it, and 'mounts', which
+# corral never asks for.
+# toml_keys FILE [KEY...] - the keys of FILE and the extra KEYs, sorted.
+toml_keys() {
+    python3 -c 'import sys, tomllib
+print(" ".join(sorted([*tomllib.load(open(sys.argv[1], "rb")), *sys.argv[2:]])))' "$@" 2>&1
+}
+is 'the example config names every key' "$(toml_keys "$CFRESH/corral/config.toml" mounts)" \
+   "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
+
 rm -rf "$CFRESH"
 QUOTED_HOMES="$TMP/a \"quoted\" \\path"
 printf '%s\n' "$QUOTED_HOMES" corral none | config_run list >/dev/null

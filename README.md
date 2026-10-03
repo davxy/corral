@@ -112,6 +112,7 @@ Each key except `mounts` is asked for only when it is missing, so a setting adde
 about that one alone. Delete the file to be asked everything again.
 
 `homes` defaults to `~/.local/share/corral/homes`.
+[`config.example.toml`](config.example.toml) shows every key.
 
 Settings that belong to one project go in its own
 [`.corral.toml`](#the-project-file) instead.
@@ -639,7 +640,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 230 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 231 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
 that empties it, that a mount inside the project takes effect, that a
