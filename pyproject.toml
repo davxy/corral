@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "corral"
 version = "0.1.0"
-description = "Run a shell with the current directory writable and the rest of the host read only"
+description = "Limit the blast radius of agents, builds and scripts"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

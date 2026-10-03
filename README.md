@@ -1,9 +1,9 @@
 # CORRAL
 
-Runs a shell with the current directory writable and the rest of the host read
-only. A coding agent can then damage only the directory you start it in. There
-is no daemon, no image and no container: `bwrap` and `pasta` do the work, and
-neither needs root. Linux only.
+Limit the blast radius of agents, builds and scripts. A program can write only
+to the current directory, it sees the rest of the host read only, and your
+home is hidden. There is no daemon, no image and no container, and no root.
+Linux only.
 
 ## Usage
 

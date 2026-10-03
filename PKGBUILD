@@ -2,7 +2,7 @@
 pkgname=corral
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Run a shell with the current directory writable and the rest of the host read only"
+pkgdesc="Limit the blast radius of agents, builds and scripts"
 arch=('any')
 url="https://github.com/davxy/corral"
 license=('MIT')
