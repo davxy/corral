@@ -763,37 +763,60 @@ is 'an empty file prints no line' '' "$(cd "$FPROJECT" && "$CORRAL_BIN" --dry-ru
 
 section 'the config file'
 
-# Settings are asked for when they are missing and written back. corral emits
-# the TOML itself, so an answer holding a quote or a backslash is where that
-# emitter breaks: it would leave a config file no later run can read, and
-# nothing to do about it but delete the file by hand.
+# Every key has a default, so a first start needs no config file and asks
+# nothing. A question stopped a start without a terminal, such as an agent
+# that starts corral from a script, with "Aborted". corral never writes the
+# config: it is the user's file. The fake HOME keeps the default homes root
+# out of the real home.
 CFRESH="$TMP/fresh-config"
-config_run() { (cd "$PROJECT" && XDG_CONFIG_HOME="$CFRESH" "$CORRAL_BIN" "$@" 2>/dev/null); }
-
+FAKEHOME="$TMP/fakehome"
+mkdir -p "$FAKEHOME"
+fresh_run() {
+    FRESH_OUT=$(cd "$PROJECT" && HOME="$FAKEHOME" XDG_CONFIG_HOME="$CFRESH" \
+                "$CORRAL_BIN" "$@" </dev/null 2>"$TMP/fresh-err")
+    PSTATUS=$?
+    FRESH_ERR=$(cat "$TMP/fresh-err")
+}
 rm -rf "$CFRESH"
-answered=$(printf '%s\n' "$TMP/homes" corral none | config_run --dry-run | tail -1)
-has 'a fresh run writes the answers as TOML' "homes = \"$TMP/homes\"" \
-    "$(cat "$CFRESH/corral/config.toml" 2>&1)"
-is  'the next run reads them back and asks nothing' "$answered" \
-    "$(config_run --dry-run </dev/null | tail -1)"
+fresh_run -n none --dry-run
+is    'a first start without a config or a terminal succeeds' '0' "$PSTATUS"
+has   'it uses the default homes root and user' \
+      "--bind $FAKEHOME/.local/share/corral/homes/corral /home/corral" "$FRESH_OUT"
+is    'it creates the sandbox home without a question' 'yes' \
+      "$([ -d "$FAKEHOME/.local/share/corral/homes/corral" ] && echo yes || echo no)"
+has   'and says so on stderr' "Created '$FAKEHOME/.local/share/corral/homes/corral'" "$FRESH_ERR"
+is    'it writes no config' 'absent' "$([ -e "$CFRESH/corral/config.toml" ] && echo there || echo absent)"
+if command -v pasta >/dev/null; then
+    fresh_run --dry-run
+    has 'the default network mode is private' 'pasta --config-net' "$FRESH_OUT"
+else
+    skip 'the default network mode is private' 'pasta is not on PATH'
+fi
+fresh_run -n none -u newcomer --dry-run
+is 'a new sandbox user is created without a question too' '0' "$PSTATUS"
+
+mkdir -p "$CFRESH/corral"
+printf 'network = "none"\n' > "$CFRESH/corral/config.toml"
+fresh_run --dry-run
+is 'a config with keys missing uses the defaults for them' '0' "$PSTATUS"
+is 'and corral does not write to it' 'network = "none"' "$(cat "$CFRESH/corral/config.toml")"
 
 # The example is documentation that nothing else checks, so it drifts the day a
-# key is added. Every key corral asks for has to be in it, and 'mounts', 'env'
-# and 'hide', which corral never asks for.
-# toml_keys FILE [KEY...] - the keys of FILE and the extra KEYs, sorted.
+# key is added.
 toml_keys() {
     python3 -c 'import sys, tomllib
-print(" ".join(sorted([*tomllib.load(open(sys.argv[1], "rb")), *sys.argv[2:]])))' "$@" 2>&1
+print(" ".join(sorted(tomllib.load(open(sys.argv[1], "rb")))))' "$1" 2>&1
 }
-is 'the example config names every key' \
-   "$(toml_keys "$CFRESH/corral/config.toml" mounts env hide)" \
+is 'the example config names every key' 'default_user env hide homes mounts network' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
-rm -rf "$CFRESH"
-QUOTED_HOMES="$TMP/a \"quoted\" \\path"
-printf '%s\n' "$QUOTED_HOMES" corral none | config_run list >/dev/null
-is 'an answer that needs escaping is read back too' "No sandbox homes under '$QUOTED_HOMES'." \
-   "$(config_run list </dev/null)"
+# The version is in three files, and a release has to change all of them.
+version=$("$CORRAL_BIN" --version 2>&1)
+is 'corral --version prints the version' 'corral 0.1.0' "$version"
+is 'pyproject.toml has the same version' "${version#corral }" \
+   "$(sed -n 's/^version = "\(.*\)"$/\1/p' "$(dirname "$CORRAL_BIN")/pyproject.toml")"
+is 'the PKGBUILD has the same version' "${version#corral }" \
+   "$(sed -n 's/^pkgver=//p' "$(dirname "$CORRAL_BIN")/PKGBUILD")"
 
 
 section 'mounts in the config'
@@ -909,12 +932,6 @@ mount_config 'env = ["X=$(echo"]'
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'an unterminated command is refused' '0' "$PSTATUS"
 
-printf 'homes = "%s"\nenv = ["SECRET=$(printf %%s-%%s top secret)"]\n' "$TMP/homes" > "$MCFG_FILE"
-(cd "$PROJECT" && printf '%s\n' corral none | XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run \
-    >/dev/null 2>&1)
-has   'a rewrite of the config keeps the command' 'SECRET=$(printf' "$(cat "$MCFG_FILE")"
-hasnt 'and does not write its output to disk' 'top-secret' "$(cat "$MCFG_FILE")"
-
 project_file "env = [\"FROM_FILE=\$(touch $TMP/project-file-ran)\"]"
 is   'a command in a project file stays text' "\$(touch $TMP/project-file-ran)" \
      "$(probe "$FPROJECT" 'echo "$FROM_FILE"')"
@@ -945,14 +962,6 @@ isnt 'a missing source in the config stops the run' '0' "$PSTATUS"
 mount_config "mounts = \"$TMP/sibling\""
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'mounts that are not a list are refused' '0' "$PSTATUS"
-
-# corral rewrites the whole file when it asks for a missing key, so a writer
-# that knows only strings would turn the list into something no run can read.
-printf 'homes = "%s"\nmounts = ["%s"]\n' "$TMP/homes" "$TMP/sibling" > "$MCFG_FILE"
-(cd "$PROJECT" && printf '%s\n' corral none | XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run \
-    >/dev/null 2>&1)
-is 'the mounts survive a rewrite of the config' 'shared' \
-   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$TMP"'/sibling/file' </dev/null)"
 
 
 section 'daemon sockets'

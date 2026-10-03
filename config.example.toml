@@ -1,5 +1,5 @@
 # Copy to ~/.config/corral/config.toml (or $XDG_CONFIG_HOME/corral/config.toml).
-# corral asks for every key except 'mounts' and 'env' when it is missing.
+# The file is optional, and so is each key. corral never writes it.
 #
 # Every value can use $(command), $NAME and ${NAME}. They expand on the host at
 # every start; '$$' is a literal '$'. Stderr and this file keep the text as

@@ -3,7 +3,7 @@
 Runs a shell with the current directory writable and the rest of the host read
 only. A coding agent can then damage only the directory you start it in. There
 is no daemon, no image and no container: `bwrap` and `pasta` do the work, and
-neither needs root.
+neither needs root. Linux only.
 
 ## Usage
 
@@ -23,6 +23,7 @@ corral list               # the sandbox homes, their size and last start
 corral remove NAME        # delete one, after a confirmation
 corral check              # report what this host is missing
 corral --help
+corral --version
 ```
 
 Only the project directory and the sandbox user's home keep changes after exit.
@@ -84,8 +85,9 @@ key.
 | `env` | variables for every sandbox, same syntax as `-e` |
 | `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
 
-corral asks for `homes`, `default_user` and `network` when they are missing.
-Delete the file to answer all of them again.
+The file is optional. Without it, or without a key, corral uses the defaults:
+`~/.local/share/corral/homes`, the user `corral` and the network `private`.
+corral never writes the file.
 
 A value can contain `$(command)`, `$NAME` and `${NAME}`, so the file can name
 a secret without the secret in it:
@@ -109,8 +111,7 @@ $ corral
 /home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -m /srv/cache:/cache:rw -e RUST_LOG=debug
 ```
 
-This line, and the file that corral writes back, show the text as written and
-not the expanded value. A `$(pass ...)` entry does not show the secret, but a
+This line shows the text as written and not the expanded value. A `$(pass ...)` entry does not show the secret, but a
 literal `NAME=VALUE` entry does.
 
 ## The project file
@@ -151,8 +152,9 @@ refuses only `$HOME` and `/`, so a file that mounts
 
 ## Sandbox users
 
-`-u NAME` binds `<homes>/NAME` at `/home/NAME`. corral asks before it creates a
-missing home, and fills a new home from `/etc/skel`. The name must match
+`-u NAME` binds `<homes>/NAME` at `/home/NAME`. corral creates a missing home,
+says so on stderr, and fills a new home from `/etc/skel`. `corral remove NAME`
+deletes a home that a typo made. The name must match
 `^[a-z_][a-z0-9_-]{0,31}$`.
 
 No host account is created. corral writes a `passwd` file with the sandbox user

@@ -14,6 +14,8 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
+VERSION = "0.1.0"
+
 CWD = Path.cwd().resolve()
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
 CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.toml"
@@ -27,6 +29,7 @@ FORCE_REMEDY = "Pass --force to override."
 PROJECT_REMEDY = f"A '{PROJECT_FILE}' cannot ask for it. Pass the mount as a flag, with --force."
 CONFIG_REMEDY = f"The config '{CONFIG_PATH}' cannot ask for it. Pass the mount as a flag, with --force."
 
+DEFAULT_HOMES = "~/.local/share/corral/homes"
 DEFAULT_USER = "corral"
 HOSTNAME = "corral"
 
@@ -111,27 +114,6 @@ SYSCTLS = {
 
 def ask_confirmation(prompt):
     return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
-
-
-def ask_config(config, key, prompt, modified, default):
-    if key in config:
-        return
-    suffix = f" [{default}]" if default else ""
-    config[key] = input(f"{prompt}{suffix}: ").strip() or default
-    modified.append(key)
-
-
-def ask_config_choice(config, key, prompt, modified, choices, default):
-    if key in config:
-        return
-    listed = "/".join(choices)
-    while True:
-        answer = input(f"{prompt} ({listed}) [{default}]: ").strip() or default
-        if answer in choices:
-            config[key] = answer
-            modified.append(key)
-            return
-        print(f"Expected one of: {listed}")
 
 
 def parse_mount(spec, guest_home, hidden, force, remedy=FORCE_REMEDY):
@@ -416,10 +398,8 @@ def build_command(config, project, args):
     homes = Path(config["homes"]).expanduser()
     home = homes / username
     if not home.is_dir():
-        print(f"There is no '{username}' sandbox yet.")
-        if not ask_confirmation(f"Create '{home}'?"):
-            raise SystemExit("Aborted.")
         home.mkdir(parents=True)
+        print(f"Created '{home}'.", file=sys.stderr)
     seed_home(home)
 
     generated = generated_dir(homes, username)
@@ -777,28 +757,6 @@ def read_table(path, label):
         raise SystemExit(f"malformed {label}: {error}")
 
 
-def dump_string(value):
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def dump_table(table):
-    """Emit what the config holds, which is a flat table of strings and lists
-    of strings.
-
-    tomllib only reads, and a whole TOML writer to put a few settings back is
-    more than the settings are worth.
-    """
-    lines = []
-    for key, value in table.items():
-        if isinstance(value, list):
-            rendered = "[" + ", ".join(dump_string(item) for item in value) + "]"
-        else:
-            rendered = dump_string(value)
-        lines.append(f"{key} = {rendered}\n")
-    return "".join(lines)
-
-
 def read_project():
     path = CWD / PROJECT_FILE
     if not path.is_file():
@@ -907,19 +865,7 @@ def load_config():
     config = {}
     if CONFIG_PATH.exists():
         config = read_table(CONFIG_PATH, f"config '{CONFIG_PATH}'")
-
-    modified = []
-    ask_config(config, "homes", "Sandboxed homes root", modified,
-               str(Path.home() / ".local/share/corral/homes"))
-    ask_config(config, "default_user", "Default sandbox user", modified, DEFAULT_USER)
-    ask_config_choice(config, "network", "Network mode", modified, NETWORKS, DEFAULT_NETWORK)
-
-    if modified:
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(dump_table(config))
-        print(f"Config saved to '{CONFIG_PATH}'!")
-
-    return config
+    return {"homes": DEFAULT_HOMES, **config}
 
 
 def run_command(command, key):
@@ -987,8 +933,8 @@ def expand(text, key):
 def expand_config(config):
     """The config with every value expanded, and the homes root created.
 
-    The text as written stays in CONFIG, because that is what goes back to the
-    file and onto the terminal.
+    The text as written stays in CONFIG, because that is what goes onto the
+    terminal.
     """
     expanded = {}
     for key, value in config.items():
@@ -1016,9 +962,8 @@ def main():
                     "the host read only.",
         epilog=f"'list' shows the sandbox homes, 'remove' deletes one and 'check' reports "
                f"what this host is missing; put '--' first to run a program by one of "
-               f"those names. Settings live in '{CONFIG_PATH}' and are asked for when "
-               f"missing. A '{PROJECT_FILE}' in the working directory adds flags for that "
-               f"project.",
+               f"those names. Settings live in '{CONFIG_PATH}', which is optional. A "
+               f"'{PROJECT_FILE}' in the working directory adds flags for that project.",
     )
     parser.add_argument("-u", "--user", help="sandbox user to run as")
     parser.add_argument("-m", "--mount", action="append", default=[],
@@ -1031,6 +976,7 @@ def main():
     parser.add_argument("--force", action="store_true",
                         help="allow the home directory or '/' as the project")
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
+    parser.add_argument("--version", action="version", version=f"corral {VERSION}")
     parser.add_argument("command", nargs=argparse.REMAINDER, metavar="COMMAND",
                         help="run this instead of the login shell; every argument "
                              "after it belongs to it")
