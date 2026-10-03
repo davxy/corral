@@ -107,8 +107,9 @@ Settings live in `~/.config/corral/config.toml` (or under `$XDG_CONFIG_HOME`).
 | `default_user` | user to run as when `--user` is not given |
 | `network` | `private`, `host` or `none`, see [Networking](#networking) |
 | `mounts` | mounts for every sandbox, see [Extra mounts](#extra-mounts) |
+| `env` | variables for every sandbox, see [Environment variables](#environment-variables) |
 
-Each key except `mounts` is asked for only when it is missing, so a setting added later asks
+Each key except `mounts` and `env` is asked for only when it is missing, so a setting added later asks
 about that one alone. Delete the file to be asked everything again.
 
 `homes` defaults to `~/.local/share/corral/homes`.
@@ -365,11 +366,11 @@ the project file's, then the flags', so either of the others covers a config
 mount on the same target.
 
 A mount that persists across sessions is a hole that is easy to forget, so
-every start prints the config mounts on stderr:
+every start prints the config mounts and variables on stderr:
 
 ```
 $ corral
-/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -m /srv/cache:/cache:rw
+/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -m /srv/cache:/cache:rw -e RUST_LOG=debug
 ```
 
 When the guest path does not exist on the read-only rootfs, `corral` replaces
@@ -465,11 +466,20 @@ under [Knowing you are inside](#knowing-you-are-inside). The third is
 the alternate screen, which terminals keep no scrollback for.
 `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` restores the stock rendering.
 
-The flag is per run by design. For a variable that one project always needs,
-use its [`.corral.toml`](#the-project-file). For one you always want, export
-it from the sandbox home's `.bashrc`, above the guard that returns early for
-non-interactive shells, so that a command run without the prompt picks it up
-too.
+The flag is per run. For a variable that one project always needs, use its
+[`.corral.toml`](#the-project-file). For one that every sandbox needs, use
+`env` in the config, with the same syntax:
+
+```toml
+env = ["RUST_LOG=debug", "GITHUB_TOKEN"]
+```
+
+Config variables come first, then the project file's, then the flags', and a
+later entry for the same name replaces the config entry. A bare name the host
+does not have stops every run, as `-e` does. The line that every start prints
+for the [config mounts](#extra-mounts) lists these too, minus the ones replaced,
+and a `NAME=VALUE` entry shows its value there. Keep a secret on the host and
+forward it by name.
 
 ## Knowing you are inside
 
@@ -647,7 +657,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 237 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 246 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
 that empties it, that a mount inside the project takes effect, that a

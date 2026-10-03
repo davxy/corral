@@ -21,3 +21,11 @@ mounts = [
     "/srv/cache:/cache:rw",
     "/etc/ssl::tmp",
 ]
+
+# Variables for every sandbox, as NAME=VALUE or NAME, the same as -e. A bare
+# NAME forwards the host's value and must be set on the host. Every start
+# prints these on stderr, so forward a secret by name.
+env = [
+    "RUST_LOG=debug",
+    "GITHUB_TOKEN",
+]

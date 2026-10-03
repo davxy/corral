@@ -285,7 +285,9 @@ def build_command(config, project, args):
               + [parse_mount(spec, guest_home, args.force) for spec in args.mount])
     guard_overlays(mounts)
     guard_bwrap_overlay(mounts)
-    variables = [parse_env(spec) for spec in project_env(project, args) + args.env]
+    variables = [parse_env(spec)
+                 for spec in config_env(config, project, args) + project_env(project, args)
+                 + args.env]
 
     homes = Path(config["homes"]).expanduser()
     home = homes / username
@@ -653,8 +655,12 @@ def read_project():
     return project
 
 
+def env_names(specs):
+    return {spec.partition("=")[0] for spec in specs}
+
+
 def project_env(project, args):
-    given = {spec.partition("=")[0] for spec in args.env}
+    given = env_names(args.env)
     return [spec for spec in project.get("env", []) if spec.partition("=")[0] not in given]
 
 
@@ -677,10 +683,15 @@ def project_flags(project, args):
     return flags
 
 
+def config_list(config, key):
+    value = config.get(key, [])
+    if not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+        raise SystemExit(f"'{key}' in '{CONFIG_PATH}' must be a list of strings")
+    return value
+
+
 def config_mounts(config):
-    mounts = config.get("mounts", [])
-    if not (isinstance(mounts, list) and all(isinstance(spec, str) for spec in mounts)):
-        raise SystemExit(f"'mounts' in '{CONFIG_PATH}' must be a list of strings")
+    mounts = config_list(config, "mounts")
     for spec in mounts:
         # The config applies to every project, so a relative path would name a
         # different directory in each one.
@@ -688,6 +699,25 @@ def config_mounts(config):
             raise SystemExit(f"invalid mount '{spec}' in '{CONFIG_PATH}': the host path must "
                              f"be absolute or start with '~'")
     return mounts
+
+
+def config_env(config, project, args):
+    given = env_names(project.get("env", []) + args.env)
+    return [spec for spec in config_list(config, "env") if spec.partition("=")[0] not in given]
+
+
+def config_flags(config, project, args):
+    """What the config adds, as the flags it stands for.
+
+    Every project gets these, so they are the most easily forgotten. A variable
+    that the project file or a flag replaces is left out.
+    """
+    flags = []
+    for spec in config_mounts(config):
+        flags += ["-m", spec]
+    for spec in config_env(config, project, args):
+        flags += ["-e", spec]
+    return flags
 
 
 def load_config():
@@ -768,10 +798,9 @@ def main():
     project = read_project()
     config = load_config()
     command = build_command(config, project, args)
-    # Every project gets these, so they are the mounts most easily forgotten.
-    mounts = [flag for spec in config_mounts(config) for flag in ("-m", spec)]
-    if mounts:
-        print(f"{CONFIG_PATH}: {shlex.join(mounts)}", file=sys.stderr)
+    flags = config_flags(config, project, args)
+    if flags:
+        print(f"{CONFIG_PATH}: {shlex.join(flags)}", file=sys.stderr)
     flags = project_flags(project, args)
     if flags:
         print(f"{PROJECT_FILE}: {shlex.join(flags)}", file=sys.stderr)

@@ -618,14 +618,14 @@ is  'the next run reads them back and asks nothing' "$answered" \
     "$(config_run --dry-run </dev/null | tail -1)"
 
 # The example is documentation that nothing else checks, so it drifts the day a
-# key is added. Every key corral asks for has to be in it, and 'mounts', which
-# corral never asks for.
+# key is added. Every key corral asks for has to be in it, and 'mounts' and
+# 'env', which corral never asks for.
 # toml_keys FILE [KEY...] - the keys of FILE and the extra KEYs, sorted.
 toml_keys() {
     python3 -c 'import sys, tomllib
 print(" ".join(sorted([*tomllib.load(open(sys.argv[1], "rb")), *sys.argv[2:]])))' "$@" 2>&1
 }
-is 'the example config names every key' "$(toml_keys "$CFRESH/corral/config.toml" mounts)" \
+is 'the example config names every key' "$(toml_keys "$CFRESH/corral/config.toml" mounts env)" \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 rm -rf "$CFRESH"
@@ -673,6 +673,38 @@ mount_config "mounts = [\"$TMP/data:~/shared:rw\"]"
 XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo from-corral > ~/shared/note' >/dev/null
 is 'a config mount under ~ is shared by every sandbox user' 'from-corral' \
    "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat ~/shared/note' -u other)"
+
+# Variables in the config follow the same order as mounts: the project file
+# and the flags replace a config entry for the same name, and the line on
+# stderr leaves out what was replaced.
+mount_config 'env = ["RUST_LOG=from-config", "SSH_AUTH_SOCK"]'
+is 'a variable from the config applies' 'from-config' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "${RUST_LOG:-unset}"')"
+is 'a bare name in the config forwards a variable corral drops' 'from-host' \
+   "$(SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" \
+      probe "$PROJECT" 'echo "${SSH_AUTH_SOCK:-unset}"')"
+SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+has 'the line names the config variables' \
+    "$MCFG_FILE: -e RUST_LOG=from-config -e SSH_AUTH_SOCK" "$ERR_OUT"
+is  'a variable flag beats the config' 'from-flag' \
+    "$(SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" \
+       probe "$PROJECT" 'echo "$RUST_LOG"' -e RUST_LOG=from-flag)"
+SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" \
+    -e RUST_LOG=from-flag --dry-run
+hasnt 'the line omits what a flag replaced' 'RUST_LOG=from-config' "$ERR_OUT"
+project_file 'env = ["RUST_LOG=from-file"]'
+is  'a variable from the project file beats the config' 'from-file' \
+    "$(SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" probe "$FPROJECT" 'echo "$RUST_LOG"')"
+project_file
+mount_config 'env = ["CORRAL_TEST_ABSENT"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a bare name the host does not have stops the run' '0' "$PSTATUS"
+mount_config 'env = ["1BAD=x"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'an invalid variable name in the config is refused' '0' "$PSTATUS"
+mount_config 'env = "RUST_LOG=x"'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'env that is not a list is refused' '0' "$PSTATUS"
 
 echo in-home > "$HOMETMP/file"
 mount_config "mounts = [\"~/${HOMETMP#"$HOST_HOME"/}\"]"
