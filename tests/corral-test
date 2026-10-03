@@ -20,9 +20,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/corral-test-XXXXXX")
 HOMETMP=$(mktemp -d "$HOST_HOME/.corral-test-XXXXXX")
 SOCK=
 SOCKPID=
+DAEMONPID=
 
 cleanup() {
     [ -n "$SOCKPID" ] && kill "$SOCKPID" 2>/dev/null
+    [ -n "$DAEMONPID" ] && kill "$DAEMONPID" 2>/dev/null
     [ -n "$SOCK" ] && rm -f "$SOCK"
     rm -rf "$TMP" "$HOMETMP"
 }
@@ -648,14 +650,15 @@ is  'the next run reads them back and asks nothing' "$answered" \
     "$(config_run --dry-run </dev/null | tail -1)"
 
 # The example is documentation that nothing else checks, so it drifts the day a
-# key is added. Every key corral asks for has to be in it, and 'mounts' and
-# 'env', which corral never asks for.
+# key is added. Every key corral asks for has to be in it, and 'mounts', 'env'
+# and 'hide', which corral never asks for.
 # toml_keys FILE [KEY...] - the keys of FILE and the extra KEYs, sorted.
 toml_keys() {
     python3 -c 'import sys, tomllib
 print(" ".join(sorted([*tomllib.load(open(sys.argv[1], "rb")), *sys.argv[2:]])))' "$@" 2>&1
 }
-is 'the example config names every key' "$(toml_keys "$CFRESH/corral/config.toml" mounts env)" \
+is 'the example config names every key' \
+   "$(toml_keys "$CFRESH/corral/config.toml" mounts env hide)" \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 rm -rf "$CFRESH"
@@ -822,6 +825,96 @@ printf 'homes = "%s"\nmounts = ["%s"]\n' "$TMP/homes" "$TMP/sibling" > "$MCFG_FI
     >/dev/null 2>&1)
 is 'the mounts survive a rewrite of the config' 'shared' \
    "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$TMP"'/sibling/file' </dev/null)"
+
+
+section 'daemon sockets'
+
+# Docker, containerd, podman and libvirt act as root for anyone who can
+# connect, and the user namespace keeps the groups of the caller. A user in
+# the 'docker' group would get root on the host. A read-only bind does not
+# stop connect(), so corral binds /dev/null over each socket. A mount of a
+# directory that holds the socket shows it again at another path, and a
+# '.corral.toml' can ask for that mount, so the /dev/null goes there too.
+DAEMON="$TMP/daemon"
+DSOCK="$DAEMON/daemon.sock"
+mkdir -p "$DAEMON"
+ln -sfn "$DAEMON" "$TMP/daemon-link"
+python3 -c 'import socket,sys,time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(16); time.sleep(600)' \
+    "$DSOCK" & DAEMONPID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$DSOCK" ] && break; sleep 0.2; done
+
+# connects DIR SOCKET [corral args...] - 'connected' or 'refused'.
+connects() {
+    probe "$1" "python3 -c 'import socket
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(\"$2\"); print(\"connected\")
+except OSError:
+    print(\"refused\")'" "${@:3}"
+}
+
+if [ -S "$DSOCK" ]; then
+    is 'without hide, a mounted socket accepts a connection' 'connected' \
+       "$(connects "$PROJECT" "$DSOCK" -m "$DAEMON")"
+    mount_config "hide = [\"$DSOCK\"]"
+    is 'a hidden socket refuses a connection under a mount of its directory' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$PROJECT" "$DSOCK" -m "$DAEMON")"
+    is 'and when the socket itself is the mount' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$PROJECT" "$DSOCK" -m "$DSOCK")"
+    is 'and at another target' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$PROJECT" /home/corral/daemon/daemon.sock \
+          -m "$DAEMON:~/daemon")"
+    is 'and in the project' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$DAEMON" "$DSOCK")"
+    project_file "mounts = [\"$DAEMON\"]"
+    is 'and when a project file asks for the mount' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$FPROJECT" "$DSOCK")"
+    project_file
+    is 'a mount on top of the directory leaves nothing to hide' 'ran' \
+       "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo ran' \
+          -m "$DAEMON" -m "$TMP/sibling:$DAEMON")"
+    mount_config "hide = [\"$TMP/daemon-link/daemon.sock\"]"
+    is 'a hide path through a symbolic link names the socket' 'refused' \
+       "$(XDG_CONFIG_HOME="$MCFG" connects "$PROJECT" "$DSOCK" -m "$DAEMON")"
+else
+    skip 'the daemon socket assertions' 'could not bind the test socket'
+fi
+
+mount_config "hide = [\"$DSOCK\"]"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+hasnt 'a hidden path that the sandbox does not show gets no bind' "$DSOCK" "$ERR_OUT"
+mount_config "hide = [\"$TMP/absent.sock\"]"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+is 'a hidden path that does not exist is ignored' '0' "$PSTATUS"
+# bwrap opens each parent of a bind target for reading, so a bind over
+# /run/containerd/containerd.sock, in a directory of mode 0711, stops the
+# start. The caller cannot connect to such a socket, and corral skips it. As
+# root, the permissions do not apply and the start works in all cases.
+mkdir -p "$TMP/sealed"
+touch "$TMP/sealed/daemon.sock"
+chmod 000 "$TMP/sealed/daemon.sock"
+chmod 311 "$TMP/sealed"
+mount_config "hide = [\"$TMP/sealed/daemon.sock\"]"
+is 'a hidden path that the caller cannot open does not stop the start' 'ran' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo ran' -m "$TMP/sealed")"
+chmod 700 "$TMP/sealed"
+mount_config 'hide = ["daemon.sock"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a relative hide path is refused' '0' "$PSTATUS"
+mount_config "hide = [\"$DAEMON\"]"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a directory in hide is refused' '0' "$PSTATUS"
+mount_config "hide = \"$DSOCK\""
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'hide that is not a list is refused' '0' "$PSTATUS"
+
+if [ -S /run/docker.sock ]; then
+    has 'the Docker socket of the host is hidden by default' \
+        '--ro-bind /dev/null /run/docker.sock' "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run)"
+else
+    skip 'the Docker socket of the host is hidden by default' 'no /run/docker.sock'
+fi
 
 
 section 'lifecycle'

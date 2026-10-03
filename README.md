@@ -79,6 +79,7 @@ key.
 | `network` | `private`, `host` or `none`, see [Networking](#networking) |
 | `mounts` | mounts for every sandbox, same syntax as `-m` |
 | `env` | variables for every sandbox, same syntax as `-e` |
+| `hide` | more files to cover with `/dev/null`, see [Filesystem](#filesystem) |
 
 corral asks for `homes`, `default_user` and `network` when they are missing.
 Delete the file to answer all of them again.
@@ -212,6 +213,15 @@ These are hidden:
 - `$XDG_RUNTIME_DIR` is a tmpfs. A read-only bind does not stop `connect()` on
   a unix socket, so without the tmpfs the sandbox can use the host ssh and gpg
   agents, and sign and push as you.
+- `/run/docker.sock`, `/run/containerd/containerd.sock`,
+  `/run/podman/podman.sock`, `/run/libvirt/libvirt-sock` and
+  `/run/pcscd/pcscd.comm` are covered with `/dev/null`. These daemons act as
+  root for any process that can connect, and the sandbox keeps your groups. A
+  user in the `docker` group gets root on the host with
+  `docker run -v /:/host`. The `hide` key adds more files. A mount of a
+  directory that holds one of them gets the `/dev/null` too, so `-m /run` does
+  not show the socket again. corral skips a file that you can neither read nor
+  write.
 - `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_CONFIG_HOME`,
   `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` are unset. `PATH`
   entries under your real home are removed.
@@ -377,6 +387,9 @@ boundary against hostile code.
 - The start directory is fully writable. A start in `~/work` gives all of
   `~/work`.
 - `private` and `host` have full outbound access, the LAN included.
+- `-n host` reaches a daemon that listens on a TCP port of the host loopback,
+  for example `dockerd -H tcp://127.0.0.1:2375`. The hidden sockets do not
+  stop that.
 - Anything in a sandbox can use the credentials in its home. After
   `gh auth login`, an agent can push and read private repositories.
 - Sandbox users share your uid.

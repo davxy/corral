@@ -33,3 +33,10 @@ env = [
     "RUST_LOG=debug",
     "GH_TOKEN=$(pass github/token)",
 ]
+
+# Files to cover with /dev/null, added to the built-in list of daemon sockets
+# (Docker, containerd, podman, libvirt, pcscd). Each must be absolute or start
+# with '~'. A path that does not exist is ignored.
+hide = [
+    "/run/user-daemon/control.sock",
+]
