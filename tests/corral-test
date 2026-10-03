@@ -863,7 +863,8 @@ is 'a config mount under ~ is shared by every sandbox user' 'from-corral' \
 # stderr leaves out what was replaced.
 mount_config 'env = ["RUST_LOG=from-config", "SSH_AUTH_SOCK"]'
 is 'a variable from the config applies' 'from-config' \
-   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "${RUST_LOG:-unset}"')"
+   "$(SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" \
+      probe "$PROJECT" 'echo "${RUST_LOG:-unset}"')"
 is 'a bare name in the config forwards a variable corral drops' 'from-host' \
    "$(SSH_AUTH_SOCK=from-host XDG_CONFIG_HOME="$MCFG" \
       probe "$PROJECT" 'echo "${SSH_AUTH_SOCK:-unset}"')"
