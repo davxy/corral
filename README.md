@@ -115,6 +115,27 @@ about that one alone. Delete the file to be asked everything again.
 `homes` defaults to `~/.local/share/corral/homes`.
 [`config.example.toml`](config.example.toml) shows every key.
 
+Every value in the config can use `$(command)`, `$NAME` and `${NAME}`, so the
+file can name a secret without holding it:
+
+```toml
+env = ["GH_TOKEN=$(pass github/token)", "DATA=$HOME/datasets"]
+```
+
+The commands run on the host with `sh -c`, outside the sandbox, at every start
+and also for `list` and `remove`. Their stdin and stderr are your terminal, so
+`pass` can ask for the passphrase. The output loses its trailing newlines, as
+in the shell. A command that fails or a variable that is not set stops the
+run. `$$` is a literal `$`, and a `$` before anything else stays as it is.
+A command ends at the matching `)`, so the parentheses inside it must balance.
+
+The expanded values are used and never shown. The line that every start prints
+on stderr and the file that corral writes back hold the text as written.
+
+A [`.corral.toml`](#the-project-file) expands nothing. It comes with a
+repository, and a command in it would run on your host the moment you type
+`corral`.
+
 Settings that belong to one project go in its own
 [`.corral.toml`](#the-project-file) instead.
 
@@ -657,7 +678,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 246 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 265 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
 that empties it, that a mount inside the project takes effect, that a

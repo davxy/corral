@@ -706,6 +706,60 @@ mount_config 'env = "RUST_LOG=x"'
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'env that is not a list is refused' '0' "$PSTATUS"
 
+# '$(command)' and '$VAR' let the config hold a reference to a secret rather
+# than the secret. The output must never reach the terminal line or the file
+# on disk, and a '.corral.toml' must never run anything: it comes with a
+# repository, and expansion there would run its author's commands on the host.
+mount_config "env = [\"SECRET=\$(printf '%s-%s' top secret)\"]"
+is 'a command in the config fills a variable' 'top-secret' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$SECRET"')"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+has   'the line shows the command as written' 'SECRET=$(printf' "$ERR_OUT"
+hasnt 'and not its output' 'top-secret' "$(printf '%s\n' "$ERR_OUT" | grep config.toml)"
+mount_config 'env = ["NEWLINE=$(echo hi)", "NESTED=$(echo $(echo inner))"]'
+is 'trailing newlines of the output are dropped' 'hi|' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'printf "%s|\n" "$NEWLINE"')"
+is 'a command inside a command runs' 'inner' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$NESTED"')"
+mount_config 'env = ["PLAIN=$CORRAL_TEST_TOKEN", "BRACED=x${CORRAL_TEST_TOKEN}y", "PRICE=$$5 and $"]'
+is 'a host variable in the config expands' 'from-host' \
+   "$(CORRAL_TEST_TOKEN=from-host XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$PLAIN"')"
+is 'so does one in braces' 'xfrom-hosty' \
+   "$(CORRAL_TEST_TOKEN=from-host XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$BRACED"')"
+is "\$\$ is a literal \$, and so is a \$ before no name" '$5 and $' \
+   "$(CORRAL_TEST_TOKEN=from-host XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$PRICE"')"
+mount_config "mounts = [\"\$(printf %s $TMP)/sibling\"]"
+is 'a command can name a mount source' 'shared' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$TMP"'/sibling/file')"
+printf 'homes = "%s"\ndefault_user = "$(printf other)"\nnetwork = "none"\n' "$TMP/homes" \
+    > "$MCFG_FILE"
+is 'a command works in a plain setting too' 'other' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$CORRAL_USER"')"
+
+mount_config 'env = ["X=$CORRAL_TEST_ABSENT"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'an unset host variable stops the run' '0' "$PSTATUS"
+has  'the refusal names the variable' 'CORRAL_TEST_ABSENT' "$ERR_OUT"
+mount_config 'env = ["X=$(exit 3)"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a failed command stops the run' '0' "$PSTATUS"
+has  'the refusal names the key' "'env'" "$ERR_OUT"
+mount_config 'env = ["X=$(echo"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'an unterminated command is refused' '0' "$PSTATUS"
+
+printf 'homes = "%s"\nenv = ["SECRET=$(printf %%s-%%s top secret)"]\n' "$TMP/homes" > "$MCFG_FILE"
+(cd "$PROJECT" && printf '%s\n' corral none | XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run \
+    >/dev/null 2>&1)
+has   'a rewrite of the config keeps the command' 'SECRET=$(printf' "$(cat "$MCFG_FILE")"
+hasnt 'and does not write its output to disk' 'top-secret' "$(cat "$MCFG_FILE")"
+
+project_file "env = [\"FROM_FILE=\$(touch $TMP/project-file-ran)\"]"
+is   'a command in a project file stays text' "\$(touch $TMP/project-file-ran)" \
+     "$(probe "$FPROJECT" 'echo "$FROM_FILE"')"
+is   'and never runs' 'absent' "$([ -e "$TMP/project-file-ran" ] && echo ran || echo absent)"
+project_file
+
 echo in-home > "$HOMETMP/file"
 mount_config "mounts = [\"~/${HOMETMP#"$HOST_HOME"/}\"]"
 is 'a host path under ~ resolves to the real home' 'in-home' \

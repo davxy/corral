@@ -38,6 +38,8 @@ USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 # Environment variable names. A typo has to be caught here, because bwrap will
 # happily set a name that no shell can read back.
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# The same names, found at the start of the text after a '$' in the config.
+VARIABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # Session sockets live here. A read-only bind does not stop connect(), so
 # leaving the host's runtime directory in place would hand the sandbox the
@@ -476,7 +478,7 @@ def sandbox_homes(homes):
 def list_homes(rest):
     argparse.ArgumentParser(prog="corral list",
                             description="List the sandbox homes.").parse_args(rest)
-    homes = Path(load_config()["homes"]).expanduser()
+    homes = Path(expand_config(load_config())["homes"]).expanduser()
     names = sandbox_homes(homes)
     if not names:
         print(f"No sandbox homes under '{homes}'.")
@@ -496,7 +498,7 @@ def remove_home(rest):
     username = parser.parse_args(rest).user
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
-    homes = Path(load_config()["homes"]).expanduser()
+    homes = Path(expand_config(load_config())["homes"]).expanduser()
     home = homes / username
     if home.is_symlink():
         raise SystemExit(f"refusing to remove '{home}': it is a symbolic link")
@@ -710,10 +712,11 @@ def config_flags(config, project, args):
     """What the config adds, as the flags it stands for.
 
     Every project gets these, so they are the most easily forgotten. A variable
-    that the project file or a flag replaces is left out.
+    that the project file or a flag replaces is left out. CONFIG is the text as
+    written, so that a secret behind '$(...)' never reaches the terminal.
     """
     flags = []
-    for spec in config_mounts(config):
+    for spec in config_list(config, "mounts"):
         flags += ["-m", spec]
     for spec in config_env(config, project, args):
         flags += ["-e", spec]
@@ -736,8 +739,88 @@ def load_config():
         CONFIG_PATH.write_text(dump_table(config))
         print(f"Config saved to '{CONFIG_PATH}'!")
 
-    Path(config["homes"]).expanduser().mkdir(parents=True, exist_ok=True)
     return config
+
+
+def run_command(command, key):
+    # stdin and stderr stay on the terminal, so that 'pass' can ask for the
+    # passphrase.
+    result = subprocess.run(["sh", "-c", command], stdout=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise SystemExit(f"'$({command})' for '{key}' in '{CONFIG_PATH}' failed "
+                         f"with status {result.returncode}")
+    return result.stdout.rstrip("\n")
+
+
+def host_variable(name, key):
+    if not ENV_NAME_RE.match(name):
+        raise SystemExit(f"invalid variable name '{name}' for '{key}' in '{CONFIG_PATH}'")
+    if name not in os.environ:
+        # Empty would turn '$DATA/x' into '/x' without a word.
+        raise SystemExit(f"'{name}' for '{key}' in '{CONFIG_PATH}' is not set on the host")
+    return os.environ[name]
+
+
+def closing_parenthesis(text, start):
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise SystemExit(f"unterminated '$(' in '{text}' in '{CONFIG_PATH}'")
+
+
+def expand(text, key):
+    """Replace '$(command)', '$NAME' and '${NAME}' with what they give on the
+    host, and '$$' with '$'. A '$' before anything else stays as it is."""
+    parts = []
+    index = 0
+    while (dollar := text.find("$", index)) != -1:
+        parts.append(text[index:dollar])
+        rest = text[dollar + 1:]
+        if rest.startswith("$"):
+            parts.append("$")
+            index = dollar + 2
+        elif rest.startswith("("):
+            end = closing_parenthesis(text, dollar + 1)
+            parts.append(run_command(text[dollar + 2:end], key))
+            index = end + 1
+        elif rest.startswith("{"):
+            end = text.find("}", dollar)
+            if end == -1:
+                raise SystemExit(f"unterminated '${{' in '{text}' in '{CONFIG_PATH}'")
+            parts.append(host_variable(text[dollar + 2:end], key))
+            index = end + 1
+        elif name := VARIABLE_RE.match(rest):
+            parts.append(host_variable(name.group(), key))
+            index = dollar + 1 + name.end()
+        else:
+            parts.append("$")
+            index = dollar + 1
+    parts.append(text[index:])
+    return "".join(parts)
+
+
+def expand_config(config):
+    """The config with every value expanded, and the homes root created.
+
+    The text as written stays in CONFIG, because that is what goes back to the
+    file and onto the terminal.
+    """
+    expanded = {}
+    for key, value in config.items():
+        if isinstance(value, list):
+            expanded[key] = [expand(item, key) if isinstance(item, str) else item
+                             for item in value]
+        elif isinstance(value, str):
+            expanded[key] = expand(value, key)
+        else:
+            expanded[key] = value
+    Path(expanded["homes"]).expanduser().mkdir(parents=True, exist_ok=True)
+    return expanded
 
 
 def main():
@@ -797,7 +880,7 @@ def main():
 
     project = read_project()
     config = load_config()
-    command = build_command(config, project, args)
+    command = build_command(expand_config(config), project, args)
     flags = config_flags(config, project, args)
     if flags:
         print(f"{CONFIG_PATH}: {shlex.join(flags)}", file=sys.stderr)
