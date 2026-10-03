@@ -55,6 +55,7 @@ user namespace                                ok    bwrap can create one
 kernel.apparmor_restrict_unprivileged_userns  ok    absent
 kernel.unprivileged_userns_clone              ok    1
 user.max_user_namespaces                      ok    2147483647
+dev.tty.legacy_tiocsti                        ok    0, and the seccomp filter of corral refuses TIOCSTI
 pasta                                         ok    pasta 2026_07_28.f8df3f1
 ```
 
@@ -63,8 +64,10 @@ flags of corral, and shows the error of `bwrap` when it fails. The three
 sysctls are the usual causes. Ubuntu 23.10 and later set the first to 1. corral
 prints the `sysctl -w` fix only when the probe fails, because an AppArmor
 profile can let `bwrap` through while the sysctl is 1. A missing `pasta` is a
-warning, because `-n host` and `-n none` still work. The exit status is 1 when
-a line says `FAIL`.
+warning, because `-n host` and `-n none` still work. The
+`dev.tty.legacy_tiocsti` line warns when the kernel allows `TIOCSTI` and corral
+has no filter for the machine, see [The terminal](#the-terminal). The exit
+status is 1 when a line says `FAIL`.
 
 ## Configuration
 
@@ -393,6 +396,21 @@ The sandbox has no capabilities, also when you start corral as root. bwrap
 makes the read-only binds and the tmpfs mounts in the user namespace of the
 sandbox. A capability in that namespace is enough to unmount them or to make
 them writable.
+
+## The terminal
+
+The sandbox shares your terminal. The `TIOCSTI` ioctl pushes characters into
+the input of a terminal, so a process in the sandbox could type a command
+that the shell which started corral runs after corral exits. The kernel
+allows it where `dev.tty.legacy_tiocsti` is 1, and always before Linux 6.2.
+`TIOCLINUX` can paste the selection of a text console in the same way.
+
+corral gives bwrap a seccomp filter that refuses both with `EPERM`, as Flatpak
+does. The filter covers x86_64 with its 32-bit and x32 programs, aarch64 with
+32-bit ARM, and riscv64. On other machines there is no filter, and
+`corral check` warns when the kernel allows `TIOCSTI`. The filter is in
+`<homes>/.corral/<user>/seccomp.bpf`. pasta closes the file descriptors that it
+gets, so a `sh -c` step opens the file after pasta, just before bwrap.
 
 ## Limits
 

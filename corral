@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import errno
 import os
+import platform
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tomllib
@@ -71,6 +74,26 @@ HIDDEN = (
     "/run/libvirt/libvirt-sock",
     "/run/pcscd/pcscd.comm",
 )
+
+# The sandbox shares the terminal of the caller. TIOCSTI types into its input,
+# and the shell that started corral runs it after corral exits. TIOCLINUX
+# pastes the selection of a text console. PowerPC and MIPS use other numbers.
+TTY_REQUESTS = (0x5412, 0x541C)
+
+# For each machine, the system calls that are ioctl, as the AUDIT_ARCH value
+# and the call numbers. A 64-bit kernel also runs 32-bit programs, and x86_64
+# also x32 ones.
+IOCTL_CALLS = {
+    "x86_64": ((0xC000003E, (16, 0x40000202)), (0x40000003, (54,))),
+    "aarch64": ((0xC00000B7, (29,)), (0x40000028, (54,))),
+    "riscv64": ((0xC00000F3, (29,)),),
+}
+
+# Classic BPF and the seccomp_data layout. The request is the second argument,
+# and its low half comes first on these little-endian machines.
+BPF_LOAD_WORD, BPF_JUMP_IF_EQUAL, BPF_RETURN = 0x20, 0x15, 0x06
+SECCOMP_NUMBER, SECCOMP_ARCH, SECCOMP_REQUEST = 0, 4, 24
+SECCOMP_ALLOW, SECCOMP_REFUSE = 0x7FFF0000, 0x00050000 | errno.EPERM
 
 OK, WARN, FAIL = "ok", "warn", "FAIL"
 
@@ -323,6 +346,38 @@ def hide_targets(hidden, layers):
     return targets
 
 
+def tty_filter(machine):
+    """A seccomp program that refuses TIOCSTI and TIOCLINUX, or None where the
+    numbers are not known.
+
+    Only the low half of the request is compared, because the kernel reads 32
+    bits. Flatpak compared 64, and 'TIOCSTI | 1 << 32' went through
+    (CVE-2019-10063).
+    """
+    if machine not in IOCTL_CALLS:
+        return None
+
+    def instruction(code, value, if_true=0, if_false=0):
+        return struct.pack("=HBBI", code, if_true, if_false, value)
+
+    requests = [instruction(BPF_LOAD_WORD, SECCOMP_REQUEST)]
+    for index, request in enumerate(TTY_REQUESTS):
+        later = len(TTY_REQUESTS) - 1 - index
+        requests.append(instruction(BPF_JUMP_IF_EQUAL, request,
+                                    if_true=later, if_false=0 if later else 1))
+    requests.append(instruction(BPF_RETURN, SECCOMP_REFUSE))
+
+    program = []
+    for arch, numbers in IOCTL_CALLS[machine]:
+        for number in numbers:
+            block = [instruction(BPF_LOAD_WORD, SECCOMP_NUMBER),
+                     instruction(BPF_JUMP_IF_EQUAL, number, if_false=len(requests))] + requests
+            program += [instruction(BPF_LOAD_WORD, SECCOMP_ARCH),
+                        instruction(BPF_JUMP_IF_EQUAL, arch, if_false=len(block))] + block
+    program.append(instruction(BPF_RETURN, SECCOMP_ALLOW))
+    return b"".join(program)
+
+
 def inside_project(target):
     return target == CWD or CWD in target.parents
 
@@ -436,6 +491,11 @@ def build_command(config, project, args):
     for guest, path in generated_etc(generated, username, guest_home).items():
         command += ["--ro-bind", str(path), guest]
 
+    seccomp = tty_filter(platform.machine())
+    if seccomp:
+        seccomp_path = generated / "seccomp.bpf"
+        seccomp_path.write_bytes(seccomp)
+
     for hidden in hidden_files:
         for target in hide_targets(hidden, layers):
             command += ["--ro-bind", "/dev/null", str(target)]
@@ -503,9 +563,16 @@ def build_command(config, project, args):
 
     if network == "none":
         command += ["--unshare-net"]
+    if seccomp:
+        command += ["--seccomp", "3"]
 
     command += (["--", "bash", "-lc", shlex.join(args.command)] if args.command
                 else ["--", "bash", "-l"])
+
+    if seccomp:
+        # pasta closes every inherited file descriptor, so the filter is opened
+        # after it, just before bwrap.
+        command = ["sh", "-c", 'exec "$@" 3<"$0"', str(seccomp_path)] + command
 
     if network == "private":
         # pasta forwards ports both ways unless told not to: a port bound on
@@ -621,6 +688,18 @@ def sysctl_row(name, value, namespaces_work):
     return FAIL, f"{value}: {meaning}", f"sudo sysctl -w {name}={allowing}"
 
 
+def tiocsti_row(value, filtered):
+    """The state of TIOCSTI. Before Linux 6.2 the sysctl is absent, and the
+    kernel always allows it."""
+    shown = value or "absent"
+    if filtered:
+        return OK, f"{shown}, and the seccomp filter of corral refuses TIOCSTI"
+    if value == "0":
+        return OK, value
+    return WARN, (f"{shown}, and corral has no seccomp filter for this machine: the sandbox "
+                  f"can type into the shell that started it")
+
+
 def tool_version(tool):
     output = subprocess.run([tool, "--version"], capture_output=True, text=True).stdout
     return output.partition("\n")[0]
@@ -664,6 +743,9 @@ def check_host(rest):
         rows.append((name, state, detail))
         if remedy:
             remedies.append(remedy)
+    state, detail = tiocsti_row(read_sysctl("dev.tty.legacy_tiocsti"),
+                                tty_filter(platform.machine()) is not None)
+    rows.append(("dev.tty.legacy_tiocsti", state, detail))
     if not shutil.which("pasta"):
         rows.append(("pasta", WARN, "not on PATH; the 'private' network mode needs it, "
                                     "from the passt package"))

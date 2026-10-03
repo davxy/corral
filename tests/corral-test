@@ -232,6 +232,130 @@ for mode in $modes; do
 done
 
 
+section 'the terminal'
+
+# The sandbox shares the terminal of the caller. TIOCSTI pushes characters
+# into its input, and the shell that started corral runs them after corral
+# exits. The kernel allows it where dev.tty.legacy_tiocsti is 1 or absent.
+# TIOCLINUX can paste the selection of a text console. corral refuses both
+# with a seccomp filter, so these tests run on a new pseudo-terminal that is
+# the controlling terminal of the sandbox. Without the filter, TIOCSTI gives
+# EIO where the sysctl is 0, and succeeds where it is 1.
+# tty_ioctls [corral args...] - the result of each ioctl, one per line.
+tty_ioctls() {
+    python3 - "$CORRAL_BIN" "$PROJECT" "$@" <<'EOF' | tr -d '\r' | sed -n '/^__B__$/,/^__E__$/{//!p;}'
+import os, pty, sys
+corral, project, *options = sys.argv[1:]
+code = """
+import ctypes, errno
+libc = ctypes.CDLL(None, use_errno=True)
+def attempt(request):
+    size = ctypes.create_string_buffer(8)
+    if libc.ioctl(0, ctypes.c_ulong(request), size) == 0:
+        return "accepted"
+    return errno.errorcode[ctypes.get_errno()]
+print("__B__")
+print(attempt(0x5412))
+print(attempt(0x5412 | 1 << 32))
+print(attempt(0x541C))
+print(attempt(0x5413))
+print("__E__")
+"""
+pid, terminal = pty.fork()
+if pid == 0:
+    os.chdir(project)
+    os.execv(corral, [corral, *options, "python3", "-c", code])
+output = b""
+while True:
+    try:
+        chunk = os.read(terminal, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    output += chunk
+os.waitpid(pid, 0)
+sys.stdout.write(output.decode(errors="replace"))
+EOF
+}
+for mode in $modes; do
+    results=$(tty_ioctls -n "$mode")
+    is "$mode: TIOCSTI is refused" 'EPERM' "$(sed -n 1p <<< "$results")"
+    # Flatpak compared all 64 bits once, and the kernel reads only the low 32
+    # (CVE-2019-10063).
+    is "$mode: TIOCSTI with high bits set is refused" 'EPERM' "$(sed -n 2p <<< "$results")"
+    is "$mode: TIOCLINUX is refused" 'EPERM' "$(sed -n 3p <<< "$results")"
+    is "$mode: other terminal requests still work" 'accepted' "$(sed -n 4p <<< "$results")"
+done
+
+# The kernel test above runs only the system calls of this machine. The filter
+# also has to catch the 32-bit and x32 calls, and the other machines. These
+# run the filter in an emulator of the three BPF instructions it uses. The
+# numbers come from linux/audit.h and scmp_sys_resolver, apart from corral.
+filter_verdicts() {
+    python3 - "$CORRAL_BIN" <<'EOF'
+import struct, sys
+corral = {"__name__": "corral"}
+exec(open(sys.argv[1]).read(), corral)
+
+def run(program, arch, number, request):
+    data = struct.pack("=iI7Q", number, arch, 0, 0, request, 0, 0, 0, 0)
+    counter = 0
+    while True:
+        code, if_true, if_false, value = struct.unpack_from("=HBBI", program, counter * 8)
+        if code == 0x20:
+            accumulator = struct.unpack_from("=I", data, value)[0]
+            counter += 1
+        elif code == 0x15:
+            counter += 1 + (if_true if accumulator == value else if_false)
+        elif code == 0x06:
+            return "refused" if value == 0x00050001 else "allowed" if value == 0x7FFF0000 else hex(value)
+        else:
+            return f"unknown instruction {code:#x}"
+
+X86_64, I386, AARCH64, ARM, RISCV64 = 0xC000003E, 0x40000003, 0xC00000B7, 0x40000028, 0xC00000F3
+TIOCSTI, TIOCLINUX, TIOCGWINSZ = 0x5412, 0x541C, 0x5413
+cases = [
+    ("x86_64", X86_64, 16, TIOCSTI),
+    ("x86_64", X86_64, 16, TIOCSTI | 1 << 32),
+    ("x86_64", X86_64, 16, TIOCLINUX),
+    ("x86_64", X86_64, 16, TIOCGWINSZ),
+    ("x86_64", I386, 54, TIOCSTI),
+    ("x86_64", X86_64, 0x40000202, TIOCSTI),
+    ("x86_64", X86_64, 54, TIOCSTI),
+    ("x86_64", I386, 16, TIOCSTI),
+    ("aarch64", AARCH64, 29, TIOCSTI),
+    ("aarch64", ARM, 54, TIOCLINUX),
+    ("aarch64", AARCH64, 54, TIOCSTI),
+    ("riscv64", RISCV64, 29, TIOCSTI),
+    ("riscv64", RISCV64, 29, TIOCGWINSZ),
+]
+for machine, arch, number, request in cases:
+    print(run(corral["tty_filter"](machine), arch, number, request))
+print(corral["tty_filter"]("ppc64le"))
+EOF
+}
+verdicts=$(filter_verdicts 2>&1)
+verdict() { sed -n "${1}p" <<< "$verdicts"; }
+is 'x86_64: TIOCSTI is refused' 'refused' "$(verdict 1)"
+is 'x86_64: TIOCSTI with high bits set is refused' 'refused' "$(verdict 2)"
+is 'x86_64: TIOCLINUX is refused' 'refused' "$(verdict 3)"
+is 'x86_64: another request is allowed' 'allowed' "$(verdict 4)"
+is 'x86_64: the 32-bit ioctl is refused' 'refused' "$(verdict 5)"
+is 'x86_64: the x32 ioctl is refused' 'refused' "$(verdict 6)"
+# 54 is setsockopt on x86_64, and 16 is lchown on i386.
+is 'x86_64: the 32-bit ioctl number is another call in 64-bit' 'allowed' "$(verdict 7)"
+is 'x86_64: the 64-bit ioctl number is another call in 32-bit' 'allowed' "$(verdict 8)"
+is 'aarch64: TIOCSTI is refused' 'refused' "$(verdict 9)"
+is 'aarch64: the 32-bit ARM ioctl is refused' 'refused' "$(verdict 10)"
+is 'aarch64: the ARM ioctl number is another call in 64-bit' 'allowed' "$(verdict 11)"
+is 'riscv64: TIOCSTI is refused' 'refused' "$(verdict 12)"
+is 'riscv64: another request is allowed' 'allowed' "$(verdict 13)"
+# PowerPC and MIPS use another TIOCSTI number. A filter with the wrong one
+# would look like protection and give none.
+is 'a machine without a known TIOCSTI gets no filter' 'None' "$(verdict 14)"
+
+
 section 'a project under /home'
 
 # Run as 'other' throughout, so that the real home and the sandbox home are
@@ -1101,6 +1225,7 @@ section 'check'
 # all. Where this suite runs, bwrap can create a user namespace, so the status
 # is 0 whatever pasta manages.
 CHECK_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" check 2>&1); status=$?
+CHECK_ALL=$CHECK_OUT
 line() { printf '%s\n' "$CHECK_OUT" | awk -v subject="$1" 'index($0, subject) == 1'; }
 is    'check succeeds where the suite runs' '0' "$status"
 has   'check reports bwrap with its version' 'bubblewrap' "$(line bwrap)"
@@ -1171,6 +1296,30 @@ is  'an absent sysctl is ok' 'ok' "${row%% *}"
 has 'and says so' 'absent' "$row"
 row=$(sysctl_row user.max_user_namespaces 0 fails)
 is  'a zero namespace limit fails' 'FAIL' "${row%% *}"
+
+# corral blocks TIOCSTI on the machines its filter knows. Elsewhere, the row
+# warns where the kernel allows TIOCSTI: before 6.2 the sysctl is absent and
+# TIOCSTI always works.
+tiocsti_row() {
+    python3 - "$CORRAL_BIN" "$@" <<'EOF'
+import sys
+corral = {"__name__": "corral"}
+exec(open(sys.argv[1]).read(), corral)
+value, filtered = sys.argv[2], sys.argv[3] == "filtered"
+state, detail = corral["tiocsti_row"](None if value == "absent" else value, filtered)
+print(state, detail)
+EOF
+}
+has 'check reports dev.tty.legacy_tiocsti' 'dev.tty.legacy_tiocsti' "$CHECK_ALL"
+row=$(tiocsti_row 1 filtered)
+is  'TIOCSTI allowed by the kernel is ok with the filter' 'ok' "${row%% *}"
+has 'and the row says that corral blocks it' 'seccomp' "$row"
+row=$(tiocsti_row 1 unfiltered)
+is  'TIOCSTI allowed by the kernel warns without the filter' 'warn' "${row%% *}"
+row=$(tiocsti_row absent unfiltered)
+is  'so does a kernel without the sysctl' 'warn' "${row%% *}"
+row=$(tiocsti_row 0 unfiltered)
+is  'TIOCSTI refused by the kernel is ok without the filter' 'ok' "${row%% *}"
 
 
 section 'mounts inside the project'
