@@ -46,6 +46,9 @@ VARIABLE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # real ssh and gpg agents.
 RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
 
+# The tmpfs mounts that everything expects to write into.
+SCRATCH = (Path("/tmp"), Path("/var/tmp"), RUNTIME_DIR)
+
 # The first two name sockets that are deliberately out of reach. The rest
 # would send agent config and state back to the caller's own home, which is
 # the exact split the sandbox users exist to keep.
@@ -108,7 +111,7 @@ def ask_config_choice(config, key, prompt, modified, choices, default):
         print(f"Expected one of: {listed}")
 
 
-def parse_mount(spec, guest_home, force, remedy=FORCE_REMEDY):
+def parse_mount(spec, guest_home, hidden, force, remedy=FORCE_REMEDY):
     parts = spec.split(":")
     if not 1 <= len(parts) <= 3:
         raise SystemExit(f"invalid mount '{spec}': expected HOST[:GUEST[:ro|rw|tmp]]")
@@ -128,7 +131,7 @@ def parse_mount(spec, guest_home, force, remedy=FORCE_REMEDY):
     source = Path(host).expanduser().resolve()
     if not source.exists():
         raise SystemExit(f"mount source '{source}' does not exist")
-    guard_path(source, force, f"refusing to mount '{source}'", remedy)
+    guard_path(source, hidden, force, f"refusing to mount '{source}'", remedy)
     # GUEST mirrors the host path by default, so a relative reference such as a
     # cargo path dependency on '../core' still resolves inside.
     return source, Path(guest) if guest else source, mode
@@ -147,12 +150,18 @@ def parse_env(spec):
     return name, os.environ[name]
 
 
-def guard_path(path, force, message, remedy=FORCE_REMEDY):
+def guard_path(path, hidden, force, message, remedy=FORCE_REMEDY):
     if force:
         return
     if path == Path("/") or path == Path.home().resolve():
         raise SystemExit(f"{message}: it is the home directory or the filesystem root.\n"
                          f"Everything below it would come along. {remedy}")
+    # A bind of the parent would show the hidden directory again. A tmpfs on
+    # it there would also cover the mounts that come after.
+    for directory in hidden:
+        if path in directory.parents:
+            raise SystemExit(f"{message}: it holds the hidden directory '{directory}'.\n"
+                             f"{remedy}")
 
 
 def guard_overlays(mounts):
@@ -198,7 +207,7 @@ def generated_dir(homes, username):
     return homes / ".corral" / username
 
 
-def generated_etc(directory, username):
+def generated_etc(directory, username, guest_home):
     """The /etc files that have to describe the sandbox rather than the host.
 
     The sandbox runs as the caller's own uid and gid, under the sandbox user's
@@ -215,7 +224,7 @@ def generated_etc(directory, username):
 
     files = {
         "/etc/passwd": replaced("/etc/passwd", uid,
-                                f"{username}:x:{uid}:{gid}::/home/{username}:/bin/bash"),
+                                f"{username}:x:{uid}:{gid}::{guest_home}:/bin/bash"),
         "/etc/group": replaced("/etc/group", gid, f"{username}:x:{gid}:"),
     }
     written = {}
@@ -269,15 +278,27 @@ def scaffold(target, tmpfs_roots):
 
 
 def hidden_paths(config):
-    paths = []
-    for spec in HIDDEN + tuple(config_hide(config)):
+    """The files and the directories to hide.
+
+    Links are resolved, because bwrap refuses to mount on one, and /home is
+    one on Fedora Atomic. The real home is hidden also when it is not under
+    /home, such as /root.
+    """
+    files, directories = [], []
+    for spec in HIDDEN + ("/home", "~") + tuple(config_hide(config)):
         path = Path(spec).expanduser().resolve()
-        # bwrap cannot bind over a file in a directory that the caller cannot
-        # read, such as /run/containerd. A file that the caller can neither
-        # read nor write needs no hiding.
-        if not path.is_dir() and (os.access(path, os.R_OK) or os.access(path, os.W_OK)):
-            paths.append(path)
-    return paths
+        # bwrap cannot mount on a path in a directory that the caller cannot
+        # read, such as /run/containerd. A path that the caller cannot open
+        # needs no hiding.
+        if path.is_dir():
+            if path != Path("/") and (os.access(path, os.R_OK) or os.access(path, os.X_OK)):
+                directories.append(path)
+        elif os.access(path, os.R_OK) or os.access(path, os.W_OK):
+            files.append(path)
+    # A tmpfs inside another one would leave its mount point there.
+    directories = [directory for directory in dict.fromkeys(directories)
+                   if not any(other in directory.parents for other in directories + list(SCRATCH))]
+    return files, directories
 
 
 def hide_targets(hidden, layers):
@@ -314,7 +335,8 @@ def build_command(config, project, args):
     username = args.user or project.get("user") or config.get("default_user") or DEFAULT_USER
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
-    guest_home = Path("/home") / username
+    hidden_files, hidden_directories = hidden_paths(config)
+    guest_home = Path("/home").resolve() / username
 
     network = args.net or project.get("network") or config.get("network") or DEFAULT_NETWORK
     if network not in NETWORKS:
@@ -323,12 +345,13 @@ def build_command(config, project, args):
         raise SystemExit("network 'private' needs 'pasta', from the 'passt' package.\n"
                          "Install it, or pass '-n host' to share the host's network.")
 
-    guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
-    mounts = ([parse_mount(spec, guest_home, False, CONFIG_REMEDY)
+    guard_path(CWD, hidden_directories, args.force, f"refusing to start in '{CWD}'")
+    mounts = ([parse_mount(spec, guest_home, hidden_directories, False, CONFIG_REMEDY)
                for spec in config_mounts(config)]
-              + [parse_mount(spec, guest_home, False, PROJECT_REMEDY)
+              + [parse_mount(spec, guest_home, hidden_directories, False, PROJECT_REMEDY)
                  for spec in project.get("mounts", [])]
-              + [parse_mount(spec, guest_home, args.force) for spec in args.mount])
+              + [parse_mount(spec, guest_home, hidden_directories, args.force)
+                 for spec in args.mount])
     guard_overlays(mounts)
     guard_bwrap_overlay(mounts)
     variables = [parse_env(spec)
@@ -347,9 +370,9 @@ def build_command(config, project, args):
     generated = generated_dir(homes, username)
     generated.mkdir(parents=True, exist_ok=True)
 
-    # '/home' is replaced wholesale so that no real home survives, which means
+    # A hidden directory, '/home' included, is replaced wholesale, which means
     # every later bind under it has to come after this one.
-    tmpfs_roots = [Path("/tmp"), Path("/var/tmp"), Path("/home")]
+    tmpfs_roots = hidden_directories + [Path("/tmp"), Path("/var/tmp")]
     if RUNTIME_DIR.is_dir():
         tmpfs_roots.append(RUNTIME_DIR)
 
@@ -366,14 +389,14 @@ def build_command(config, project, args):
 
     # What each mount shows, for the daemon sockets to be hidden at every path.
     layers = [(Path("/"), Path("/"))]
-    command = ["bwrap", "--ro-bind", "/", "/"] + scaffolding + [
-        "--dev", "/dev",
-        "--proc", "/proc",
-        "--tmpfs", "/tmp",
-        "--tmpfs", "/var/tmp",
-        "--tmpfs", "/home",
-    ]
-    layers += [(None, Path("/tmp")), (None, Path("/var/tmp")), (None, Path("/home"))]
+    command = ["bwrap", "--ro-bind", "/", "/"] + scaffolding + ["--dev", "/dev", "--proc", "/proc"]
+    # Before the scratch tmpfs mounts, because 'hide = ["/var"]' would bury
+    # '/var/tmp'.
+    for directory in hidden_directories:
+        command += ["--tmpfs", str(directory)]
+        layers.append((None, directory))
+    command += ["--tmpfs", "/tmp", "--tmpfs", "/var/tmp"]
+    layers += [(None, Path("/tmp")), (None, Path("/var/tmp"))]
     if RUNTIME_DIR.is_dir():
         command += ["--perms", "0700", "--tmpfs", str(RUNTIME_DIR)]
         layers.append((None, RUNTIME_DIR))
@@ -410,10 +433,10 @@ def build_command(config, project, args):
 
     # After the overlays in turn: '-m /etc::tmp' would otherwise bury these two
     # and the sandbox would answer getpwuid() with the caller's host entry.
-    for guest, path in generated_etc(generated, username).items():
+    for guest, path in generated_etc(generated, username, guest_home).items():
         command += ["--ro-bind", str(path), guest]
 
-    for hidden in hidden_paths(config):
+    for hidden in hidden_files:
         for target in hide_targets(hidden, layers):
             command += ["--ro-bind", "/dev/null", str(target)]
 
@@ -426,11 +449,13 @@ def build_command(config, project, args):
     # This has to come after every bind, because bwrap applies operations in
     # order and a bind needs its mount point to be writable at the moment it is
     # made. '--remount-ro' does not recurse, so the binds underneath stay
-    # writable. '/tmp', '/var/tmp' and the runtime directory are left alone:
-    # those are scratch, and everything expects to write there.
-    scratch = (Path("/tmp"), Path("/var/tmp"), RUNTIME_DIR)
+    # writable. Scratch is left alone. So is a tmpfs that a bind covers, such
+    # as a hidden directory that is also the project: the remount would reach
+    # the bind.
+    bound = [target for source, target in layers if source and target != Path("/")]
     for root in tmpfs_roots:
-        if root not in scratch:
+        covered = any(target == root or target in root.parents for target in bound)
+        if root not in SCRATCH and not covered:
             command += ["--remount-ro", str(root)]
 
     # The caller's own bin directories are gone with the home, so an entry that
@@ -771,8 +796,8 @@ def config_hide(config):
         if not path.is_absolute():
             raise SystemExit(f"invalid path '{spec}' under 'hide' in '{CONFIG_PATH}': it must "
                              f"be absolute or start with '~'")
-        if path.is_dir():
-            raise SystemExit(f"cannot hide '{spec}' from '{CONFIG_PATH}': it is a directory")
+        if path.resolve() == Path("/"):
+            raise SystemExit(f"cannot hide '/' from '{CONFIG_PATH}': nothing would be left")
     return paths
 
 

@@ -79,7 +79,7 @@ key.
 | `network` | `private`, `host` or `none`, see [Networking](#networking) |
 | `mounts` | mounts for every sandbox, same syntax as `-m` |
 | `env` | variables for every sandbox, same syntax as `-e` |
-| `hide` | more files to cover with `/dev/null`, see [Filesystem](#filesystem) |
+| `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
 
 corral asks for `homes`, `default_user` and `network` when they are missing.
 Delete the file to answer all of them again.
@@ -209,7 +209,22 @@ These are hidden:
 
 - `/home` is a tmpfs. It contains the sandbox home and the path down to the
   project, and nothing more. A symbolic link out of the project resolves in
-  the sandbox, where the target is missing.
+  the sandbox, where the target is missing. Your real home also gets a tmpfs
+  when it is not under `/home`, for example `/root`. Your home holds your
+  credentials: ssh and gpg keys, tokens in `~/.config`, `~/.aws` and
+  `~/.netrc`, browser profiles. A read-only bind stops writes, not reads, and
+  `private` mode lets outbound traffic go. Without the tmpfs, an agent can
+  read them and send them out. A tool in the sandbox also finds its config
+  in the sandbox home, and not in yours by an absolute path. The homes of
+  other users under `/home` can also be readable. To give the sandbox one thing from
+  your home, use `-m`, for example `-m ~/notes`.
+- Each directory under the `hide` key is a tmpfs in the same way. With
+  `hide = ["/mnt/ssd/develop"]`, a project in `/mnt/ssd/develop/app` does not
+  see the other projects next to it. The project and the `-m` mounts under a
+  hidden directory are bound back on top. corral refuses a mount, or a start,
+  in a parent of a hidden directory, because it would show the directory
+  again. `--force` lifts this for the start directory and for `-m`, but not
+  for the config or a project file.
 - `$XDG_RUNTIME_DIR` is a tmpfs. A read-only bind does not stop `connect()` on
   a unix socket, so without the tmpfs the sandbox can use the host ssh and gpg
   agents, and sign and push as you.
@@ -405,9 +420,10 @@ $ ./tests/corral-test
 ```
 
 The suite needs `bwrap` and no config. It writes its own `config.toml` under a
-temporary `XDG_CONFIG_HOME`. It also uses a temporary directory in `$TMPDIR`
-and one under `$HOME`, because a project below `/home` is one of the tested
-cases. It removes all of them at exit.
+temporary `XDG_CONFIG_HOME`. It also uses a temporary directory in `$TMPDIR`,
+one under `$HOME`, because a project below `/home` is one of the tested
+cases, and one next to `corral`, for the hidden directories. It removes all
+of them at exit.
 
 The `private` tests skip when `pasta` cannot run, for example in a corral
 sandbox without `/dev/net/tun`. The `:tmp` tests skip with `bwrap` older than

@@ -34,9 +34,12 @@ env = [
     "GH_TOKEN=$(pass github/token)",
 ]
 
-# Files to cover with /dev/null, added to the built-in list of daemon sockets
-# (Docker, containerd, podman, libvirt, pcscd). Each must be absolute or start
-# with '~'. A path that does not exist is ignored.
+# Paths to hide, added to /home, the real home and the built-in list of daemon
+# sockets (Docker, containerd, podman, libvirt, pcscd). A file is covered with
+# /dev/null. A directory gets an empty tmpfs, and the project and the mounts
+# under it are bound back. Each must be absolute or start with '~'. A path that
+# does not exist is ignored.
 hide = [
+    "/mnt/data/develop",
     "/run/user-daemon/control.sock",
 ]
