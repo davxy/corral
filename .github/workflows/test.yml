@@ -59,7 +59,10 @@ jobs:
         # Nothing else reads the pyproject.toml, so this is where a broken one
         # shows. 'check' runs the installed script for real, and it fails only
         # where the suite above has already failed.
+        # The runner can move the pipx bin directory away from ~/.local/bin.
         run: |
           pipx install .
-          ~/.local/bin/corral --help
-          ~/.local/bin/corral check
+          bin=$(pipx environment --value PIPX_BIN_DIR)
+          echo "pipx installed corral in $bin"
+          "$bin/corral" --help
+          "$bin/corral" check
