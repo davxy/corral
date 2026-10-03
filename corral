@@ -26,12 +26,6 @@ PROJECT_REMEDY = f"A '{PROJECT_FILE}' cannot ask for it. Pass the mount as a fla
 DEFAULT_USER = "corral"
 HOSTNAME = "corral"
 
-# Where the shared toolchain is mounted in the guest. The path is fixed
-# because rustup proxies, uv shims and Python entry points hardcode absolute
-# paths into what they install, so the directory only works when it comes
-# back at the same path every run.
-TOOLS_GUEST = "/opt/corral"
-
 # 'private' gives the sandbox its own network namespace with a userspace stack,
 # so the internet works but the host's own loopback services do not answer.
 NETWORKS = ("private", "host", "none")
@@ -297,12 +291,6 @@ def build_command(config, project, args):
     generated.mkdir(parents=True, exist_ok=True)
     guest_home = Path("/home") / username
 
-    tools = Path(config["tools"]).expanduser() if config.get("tools") else None
-    if tools and not tools.is_dir():
-        print(f"warning: toolchain '{tools}' does not exist; nothing is mounted at "
-              f"{TOOLS_GUEST}", file=sys.stderr)
-        tools = None
-
     # '/home' is replaced wholesale so that no real home survives, which means
     # every later bind under it has to come after this one.
     tmpfs_roots = [Path("/tmp"), Path("/var/tmp"), Path("/home")]
@@ -316,8 +304,6 @@ def build_command(config, project, args):
     # Nor under the project: that is writable, so bwrap creates the mount
     # point there, and it stays on the host.
     scaffolding = []
-    if tools:
-        scaffolding += scaffold(Path(TOOLS_GUEST), tmpfs_roots)
     for _, target, _ in mounts:
         if not inside_project(target):
             scaffolding += scaffold(target, tmpfs_roots)
@@ -334,8 +320,6 @@ def build_command(config, project, args):
 
     command += ["--bind", str(home), str(guest_home)]
 
-    if tools:
-        command += ["--ro-bind", str(tools), TOOLS_GUEST]
     binds = [(source, target, mode) for source, target, mode in mounts if mode != "tmp"]
     for source, target, mode in binds:
         if not inside_project(target):
@@ -380,14 +364,12 @@ def build_command(config, project, args):
         if root not in scratch:
             command += ["--remount-ro", str(root)]
 
-    tool_paths = [f"{TOOLS_GUEST}/.local/bin", f"{TOOLS_GUEST}/.cargo/bin"] if tools else []
     # The caller's own bin directories are gone with the home, so an entry that
     # points into it would only slow every lookup down.
     real_home = str(Path.home().resolve())
     inherited = [entry for entry in os.environ.get("PATH", "").split(":")
                  if entry and not entry.startswith(real_home + "/")]
-    path = ":".join([f"{guest_home}/.local/bin", f"{guest_home}/.cargo/bin"]
-                    + tool_paths + inherited)
+    path = ":".join([f"{guest_home}/.local/bin", f"{guest_home}/.cargo/bin"] + inherited)
 
     command += [
         "--setenv", "HOME", str(guest_home),
@@ -618,8 +600,8 @@ def read_table(path, label):
 def dump_table(table):
     """Emit what the config holds, which is a flat table of strings.
 
-    tomllib only reads, and a whole TOML writer to put four settings back is
-    more than the four settings are worth.
+    tomllib only reads, and a whole TOML writer to put three settings back is
+    more than the three settings are worth.
     """
     lines = []
     for key, value in table.items():
@@ -686,7 +668,6 @@ def load_config():
     modified = []
     ask_config(config, "homes", "Sandboxed homes root", modified,
                str(Path.home() / ".local/share/corral/homes"))
-    ask_config(config, "tools", "Shared toolchain directory, empty for none", modified, "")
     ask_config(config, "default_user", "Default sandbox user", modified, DEFAULT_USER)
     ask_config_choice(config, "network", "Network mode", modified, NETWORKS, DEFAULT_NETWORK)
 

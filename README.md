@@ -104,7 +104,6 @@ Settings live in `~/.config/corral/config.toml` (or under `$XDG_CONFIG_HOME`).
 | key | meaning |
 |-----|---------|
 | `homes` | host directory holding one `$HOME` per sandbox user |
-| `tools` | host directory holding a shared toolchain, mounted read only at `/opt/corral`, empty for none |
 | `default_user` | user to run as when `--user` is not given |
 | `network` | `private`, `host` or `none`, see [Networking](#networking) |
 
@@ -547,26 +546,15 @@ The command runs through a login shell, so it sees the same `PATH` and profile
 environment you would get at the prompt, and bare tool names resolve. Its exit
 status becomes corral's, which makes this usable from scripts and CI.
 
-## The shared toolchain
+## The host rootfs
 
-`tools` in the config names a host directory that is mounted read only at
-`/opt/corral`. `PATH` inside is
+`PATH` inside is
 
 ```
-/home/<user>/.local/bin:/home/<user>/.cargo/bin:/opt/corral/.local/bin:/opt/corral/.cargo/bin:<inherited>
+/home/<user>/.local/bin:/home/<user>/.cargo/bin:<inherited>
 ```
 
-so the per-user directories take precedence, and what a user installs on top
-shadows the shared copy.
-
-The guest path is fixed on purpose. rustup proxies, uv shims and Python entry
-points hardcode absolute paths into what they install, so the directory only
-works when it comes back at the same path every run.
-
-`corral` does not provision it. It only mounts a directory that already exists.
-Run the installers yourself with the directory mounted writable and `HOME`
-pointed at it. A `tools` path that does not exist produces a warning on stderr
-and no mount.
+so what a user installs in its own home shadows the host copy.
 
 Everything else comes from the host rootfs. There is no base image, no
 package list and no `--rebuild`. That is the trade: `corral` gives up a pinned,

@@ -34,7 +34,6 @@ export XDG_CONFIG_HOME="$TMP/config"
 mkdir -p "$XDG_CONFIG_HOME/corral" "$TMP/homes/corral" "$TMP/homes/other"
 cat > "$XDG_CONFIG_HOME/corral/config.toml" <<EOF
 homes = "$TMP/homes"
-tools = ""
 default_user = "corral"
 network = "none"
 EOF
@@ -600,16 +599,17 @@ CFRESH="$TMP/fresh-config"
 config_run() { (cd "$PROJECT" && XDG_CONFIG_HOME="$CFRESH" "$CORRAL_BIN" "$@" 2>/dev/null); }
 
 rm -rf "$CFRESH"
-answered=$(printf '%s\n' "$TMP/homes" "" corral none | config_run --dry-run | tail -1)
+answered=$(printf '%s\n' "$TMP/homes" corral none | config_run --dry-run | tail -1)
 has 'a fresh run writes the answers as TOML' "homes = \"$TMP/homes\"" \
     "$(cat "$CFRESH/corral/config.toml" 2>&1)"
 is  'the next run reads them back and asks nothing' "$answered" \
     "$(config_run --dry-run </dev/null | tail -1)"
 
 rm -rf "$CFRESH"
-printf '%s\n' "$TMP/homes" 'a "quoted" \path' corral none | config_run --dry-run >/dev/null
-is 'an answer that needs escaping is read back too' "$answered" \
-   "$(config_run --dry-run </dev/null | tail -1)"
+QUOTED_HOMES="$TMP/a \"quoted\" \\path"
+printf '%s\n' "$QUOTED_HOMES" corral none | config_run list >/dev/null
+is 'an answer that needs escaping is read back too' "No sandbox homes under '$QUOTED_HOMES'." \
+   "$(config_run list </dev/null)"
 
 
 section 'lifecycle'
@@ -640,7 +640,7 @@ is 'the size counts what is inside' '1.0M' "$(row unused | awk '{ print $2 }')"
 
 EMPTYCFG="$TMP/empty-config"
 mkdir -p "$EMPTYCFG/corral" "$TMP/empty-homes"
-printf 'homes = "%s"\ntools = ""\ndefault_user = "corral"\nnetwork = "none"\n' \
+printf 'homes = "%s"\ndefault_user = "corral"\nnetwork = "none"\n' \
        "$TMP/empty-homes" > "$EMPTYCFG/corral/config.toml"
 has 'an empty root says so' 'No sandbox homes' \
     "$(cd "$PROJECT" && XDG_CONFIG_HOME="$EMPTYCFG" "$CORRAL_BIN" list 2>&1 </dev/null)"
