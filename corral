@@ -190,23 +190,22 @@ def generated_dir(homes, username):
 def generated_etc(directory, username):
     """The /etc files that have to describe the sandbox rather than the host.
 
-    The sandbox runs as uid 0, because creating a network namespace needs
-    CAP_NET_ADMIN, which an unprivileged user only gets by becoming root
-    inside a new user namespace. That 0 maps back to the caller's own uid on
-    the host, so it carries no host privilege at all.
-
-    passwd matters because some tools read $HOME while others call getpwuid().
-    Both have to give the sandbox home, or agent state lands in a directory
-    that is not mounted.
+    The sandbox runs as the caller's own uid and gid, under the sandbox user's
+    name. passwd matters because some tools read $HOME while others call
+    getpwuid(). Both have to give the sandbox home, or agent state lands in a
+    directory that is not mounted.
     """
-    def replaced(source, added):
+    uid, gid = os.getuid(), os.getgid()
+
+    def replaced(source, number, added):
         lines = [line for line in Path(source).read_text().splitlines()
-                 if line.split(":")[2:3] != ["0"]]
+                 if line.split(":")[2:3] != [str(number)]]
         return "\n".join(lines + [added]) + "\n"
 
     files = {
-        "/etc/passwd": replaced("/etc/passwd", f"{username}:x:0:0::/home/{username}:/bin/bash"),
-        "/etc/group": replaced("/etc/group", f"{username}:x:0:"),
+        "/etc/passwd": replaced("/etc/passwd", uid,
+                                f"{username}:x:{uid}:{gid}::/home/{username}:/bin/bash"),
+        "/etc/group": replaced("/etc/group", gid, f"{username}:x:{gid}:"),
     }
     written = {}
     for guest, text in files.items():
@@ -356,7 +355,7 @@ def build_command(config, project, args):
             command += ["--overlay-src", str(source), "--tmp-overlay", str(target)]
 
     # After the overlays in turn: '-m /etc::tmp' would otherwise bury these two
-    # and the sandbox would answer getpwuid() with the host's entry for uid 0.
+    # and the sandbox would answer getpwuid() with the caller's host entry.
     for guest, path in generated_etc(generated, username).items():
         command += ["--ro-bind", str(path), guest]
 
@@ -404,9 +403,12 @@ def build_command(config, project, args):
         command += ["--setenv", name, value]
 
     command += [
-        # Held to one uid so that the identity does not change with the
-        # network mode; see generated_etc for why that uid is 0.
-        "--unshare-user", "--uid", "0", "--gid", "0",
+        # The caller's ids in every network mode. Under pasta, bwrap starts
+        # as uid 0 and maps them onto it.
+        "--unshare-user", "--uid", str(os.getuid()), "--gid", str(os.getgid()),
+        # bwrap keeps every capability for a caller that is root. With them,
+        # the sandbox could unmount or remount its own read-only mounts.
+        "--cap-drop", "ALL",
         "--unshare-pid",
         "--unshare-ipc",
         # Fixed, because the network helper otherwise renames the host and the
@@ -567,7 +569,8 @@ def check_host(rest):
             rows.append(("bwrap", WARN, f"{version}, older than 0.11.0, so ':tmp' mounts "
                                         f"are unavailable"))
         namespaces_work, error = probe([
-            "bwrap", "--ro-bind", "/", "/", "--unshare-user", "--uid", "0", "--gid", "0",
+            "bwrap", "--ro-bind", "/", "/", "--unshare-user",
+            "--uid", str(os.getuid()), "--gid", str(os.getgid()),
             "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-net", "--", "true"])
         if namespaces_work:
             rows.append(("user namespace", OK, "bwrap can create one"))

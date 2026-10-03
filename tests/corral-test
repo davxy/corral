@@ -104,7 +104,6 @@ is 'USER is the sandbox user' 'corral' "$(probe "$PROJECT" 'echo "$USER"')"
 is 'getpwuid agrees with HOME' '/home/corral' \
    "$(probe "$PROJECT" 'getent passwd "$(id -u)" | cut -d: -f6')"
 is 'the hostname is fixed' 'corral' "$(probe "$PROJECT" 'cat /proc/sys/kernel/hostname')"
-is 'the sandbox runs as uid 0' '0' "$(probe "$PROJECT" 'id -u')"
 
 out=$(cd "$PROJECT" && CORRAL=1 CORRAL_USER=outer "$CORRAL_BIN" true 2>&1); status=$?
 isnt 'nesting is refused' '0' "$status"
@@ -194,6 +193,37 @@ else
     skip 'a host agent socket is out of reach' 'XDG_RUNTIME_DIR is not set'
     skip 'a host agent socket cannot be connected to' 'XDG_RUNTIME_DIR is not set'
 fi
+
+
+section 'uid and capabilities'
+
+# The sandbox runs as the caller, so a tool that refuses root still runs. It
+# holds no capability: bwrap makes the read-only binds and the tmpfs over /home
+# in the user namespace of the sandbox, and a capability there is enough to
+# undo them. bwrap keeps every capability for '--uid 0' when it starts as uid
+# 0, which it does under pasta, so each network mode is checked.
+modes='none host'
+if pasta --config-net --no-map-gw --quiet -- /bin/true >/dev/null 2>&1; then
+    modes="$modes private"
+else
+    skip 'private: every uid and capability assertion' 'pasta cannot run here'
+fi
+mkdir -p "$TMP/walled"
+for mode in $modes; do
+    is "$mode: the sandbox runs as the uid of the caller" "$(id -u)" \
+       "$(probe "$PROJECT" 'id -u' -n "$mode")"
+    is "$mode: the sandbox runs with the gid of the caller" "$(id -g)" \
+       "$(probe "$PROJECT" 'id -g' -n "$mode")"
+    is "$mode: the sandbox holds no capabilities" '0000000000000000' \
+       "$(probe "$PROJECT" "awk '/^CapEff:/ { print \$2 }' /proc/self/status" -n "$mode")"
+    probe "$PROJECT" 'mount -o remount,bind,rw '"$TMP"'/walled; touch '"$TMP/walled/$mode" \
+          -m "$TMP/walled" -n "$mode" >/dev/null
+    is "$mode: the sandbox cannot remount a read-only mount writable" 'gone' \
+       "$([ -e "$TMP/walled/$mode" ] && echo there || echo gone)"
+    is "$mode: the sandbox cannot unmount the tmpfs over /home" 'refused' \
+       "$(probe "$PROJECT" 'umount -l /home 2>/dev/null && echo unmounted || echo refused' \
+          -n "$mode")"
+done
 
 
 section 'a project under /home'
@@ -295,7 +325,7 @@ if has_overlay_bwrap; then
 
     # An overlay covers whatever already stands at its target, so it has to be
     # emitted before the generated passwd. After it, the overlay would bury that
-    # passwd and getpwuid() would answer with the host's entry for uid 0.
+    # passwd and getpwuid() would answer with the caller's host entry.
     if has_submount /etc; then
         skip 'an overlay on /etc keeps the generated passwd' '/etc holds a mount point here'
     else

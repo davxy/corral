@@ -30,8 +30,7 @@ Only the project directory and the sandbox user's home keep changes after exit.
 ## Install
 
 corral needs `bubblewrap`, `passt` for the default network mode, and Python
-3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer. Ubuntu 24.04
-has 0.9.0.
+3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer.
 
 ```
 sudo pacman -S bubblewrap passt          # Arch
@@ -360,23 +359,15 @@ The command starts at the first argument that is not a corral option. Put `--`
 before a command that starts with a dash. The command runs in a login shell,
 and its exit status is the exit status of corral.
 
-## Why the sandbox runs as uid 0
+## Uid and capabilities
 
-`id` shows `uid=0`, and the prompt ends in `#`. This is not host root.
+The sandbox runs as your host uid and gid in every network mode, under the
+name of the sandbox user. Host files that root owns show as `nobody`.
 
-A network namespace needs `CAP_NET_ADMIN`. An unprivileged user gets it only
-as root in a new user namespace. `pasta` maps `0 <your uid> 1`, and a nested
-user namespace cannot map a uid that its parent does not have. corral uses
-`--uid 0 --gid 0` in every network mode, so the identity does not change with
-`-n`. Uid 0 is your own host uid and gives nothing on the host:
-
-```
-$ sudo -n true
-sudo: /etc/sudo.conf is owned by uid 65534, should be 0
-sudo: unable to open /etc/sudoers: Invalid argument
-```
-
-Host files that root owns show as `nobody`.
+The sandbox has no capabilities, also when you start corral as root. bwrap
+makes the read-only binds and the tmpfs mounts in the user namespace of the
+sandbox. A capability in that namespace is enough to unmount them or to make
+them writable.
 
 ## Limits
 
