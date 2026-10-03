@@ -612,6 +612,73 @@ is 'an answer that needs escaping is read back too' "No sandbox homes under '$QU
    "$(config_run list </dev/null)"
 
 
+section 'mounts in the config'
+
+# The config is the one file that applies to every project, so a mount there
+# is the easiest to forget. The line on stderr at every start is what keeps it
+# visible. It is the user's own file, but it still cannot lift the guard on
+# $HOME and '/', and a relative path would mean a different directory in each
+# project.
+MCFG="$TMP/mount-config"
+MCFG_FILE="$MCFG/corral/config.toml"
+mkdir -p "$MCFG/corral"
+mount_config() {
+    printf 'homes = "%s"\ndefault_user = "corral"\nnetwork = "none"\n' "$TMP/homes" > "$MCFG_FILE"
+    printf '%s\n' "$@" >> "$MCFG_FILE"
+}
+
+mount_config "mounts = [\"$TMP/sibling\"]"
+is  'a mount from the config applies' 'shared' \
+    "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$TMP"'/sibling/file')"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+has 'one line names the config and its mounts' "$MCFG_FILE: -m $TMP/sibling" "$ERR_OUT"
+hasnt 'that line is not on stdout' "$MCFG_FILE" \
+    "$(cd "$PROJECT" && XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run 2>/dev/null)"
+hasnt 'a config with no mounts prints no line' 'config.toml' \
+    "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run 2>&1 >/dev/null)"
+
+is 'a mount flag on the same target beats the config' 'wrote' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" \
+      'touch '"$TMP"'/sibling/from-flag && echo wrote' -m "$TMP/sibling::rw")"
+project_file 'mounts = ["../sibling::rw"]'
+is 'a project file mount on the same target beats the config' 'wrote' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$FPROJECT" 'touch '"$TMP"'/sibling/from-file && echo wrote')"
+project_file
+
+echo in-home > "$HOMETMP/file"
+mount_config "mounts = [\"~/${HOMETMP#"$HOST_HOME"/}\"]"
+is 'a host path under ~ resolves to the real home' 'in-home' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$HOMETMP"'/file')"
+
+mount_config 'mounts = ["../sibling"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a relative host path in the config is refused' '0' "$PSTATUS"
+has  'the refusal asks for an absolute path' 'absolute' "$ERR_OUT"
+mount_config 'mounts = [".::ro"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt "so is '.', which is a different project each time" '0' "$PSTATUS"
+
+mount_config 'mounts = ["~"]'
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --force --dry-run
+isnt '--force does not lift the guard for a config mount' '0' "$PSTATUS"
+has  'and the refusal names the config' "$MCFG_FILE" "$ERR_OUT"
+
+mount_config "mounts = [\"$TMP/absent\"]"
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'a missing source in the config stops the run' '0' "$PSTATUS"
+mount_config "mounts = \"$TMP/sibling\""
+XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+isnt 'mounts that are not a list are refused' '0' "$PSTATUS"
+
+# corral rewrites the whole file when it asks for a missing key, so a writer
+# that knows only strings would turn the list into something no run can read.
+printf 'homes = "%s"\nmounts = ["%s"]\n' "$TMP/homes" "$TMP/sibling" > "$MCFG_FILE"
+(cd "$PROJECT" && printf '%s\n' corral none | XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run \
+    >/dev/null 2>&1)
+is 'the mounts survive a rewrite of the config' 'shared' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat '"$TMP"'/sibling/file' </dev/null)"
+
+
 section 'lifecycle'
 
 # The homes root is the one place corral leaves state behind, and until now

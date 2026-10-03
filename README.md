@@ -106,8 +106,9 @@ Settings live in `~/.config/corral/config.toml` (or under `$XDG_CONFIG_HOME`).
 | `homes` | host directory holding one `$HOME` per sandbox user |
 | `default_user` | user to run as when `--user` is not given |
 | `network` | `private`, `host` or `none`, see [Networking](#networking) |
+| `mounts` | mounts for every sandbox, see [Extra mounts](#extra-mounts) |
 
-Each key is asked for only when it is missing, so a setting added later asks
+Each key except `mounts` is asked for only when it is missing, so a setting added later asks
 about that one alone. Delete the file to be asked everything again.
 
 `homes` defaults to `~/.local/share/corral/homes`.
@@ -338,12 +339,30 @@ unless `:rw` is appended, or `:tmp` for
 [writes that go nowhere](#writes-that-go-nowhere).
 
 The source has to exist, and the refusal of `$HOME` and `/` applies to mount
-sources too, with `--force` overriding it as usual. There is deliberately no
-key for this in the global config. A mount that persisted invisibly across
-sessions is a hole you would forget about, while a flag you retype keeps it
-intentional. A mount that one project always needs goes in that project's
-[`.corral.toml`](#the-project-file), which is committed and shows in every
-diff.
+sources too, with `--force` overriding it as usual. A mount that one project
+always needs goes in that project's [`.corral.toml`](#the-project-file), which
+is committed and shows in every diff.
+
+A mount that every sandbox needs goes under `mounts` in the config, with the
+same syntax:
+
+```toml
+mounts = ["~/datasets:/data:ro", "/srv/cache:/cache:rw"]
+```
+
+The host path must be absolute or start with `~`, because a relative one, `.`
+included, would name a different directory in each project. `--force` does not
+lift the refusal of `$HOME` and `/` for these. Config mounts come first, then
+the project file's, then the flags', so either of the others covers a config
+mount on the same target.
+
+A mount that persists across sessions is a hole that is easy to forget, so
+every start prints the config mounts on stderr:
+
+```
+$ corral
+/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -m /srv/cache:/cache:rw
+```
 
 When the guest path does not exist on the read-only rootfs, `corral` replaces
 its parent with a tmpfs so the mount point can be created, and binds the
@@ -620,11 +639,12 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 215 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 230 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
 that empties it, that a mount inside the project takes effect, that a
-`.corral.toml` adds what it says and no more, that `list` and `remove` see
+`.corral.toml` adds what it says and no more, that a config mount is
+announced and covered by a flag, that `list` and `remove` see
 real homes and nothing else, and that `check` fails only when corral cannot
 run.
 

@@ -22,6 +22,7 @@ PROJECT_KEYS = ("network", "user", "mounts", "env")
 
 FORCE_REMEDY = "Pass --force to override."
 PROJECT_REMEDY = f"A '{PROJECT_FILE}' cannot ask for it. Pass the mount as a flag, with --force."
+CONFIG_REMEDY = f"The config '{CONFIG_PATH}' cannot ask for it. Pass the mount as a flag, with --force."
 
 DEFAULT_USER = "corral"
 HOSTNAME = "corral"
@@ -272,7 +273,8 @@ def build_command(config, project, args):
                          "Install it, or pass '-n host' to share the host's network.")
 
     guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
-    mounts = ([parse_mount(spec, False, PROJECT_REMEDY) for spec in project.get("mounts", [])]
+    mounts = ([parse_mount(spec, False, CONFIG_REMEDY) for spec in config_mounts(config)]
+              + [parse_mount(spec, False, PROJECT_REMEDY) for spec in project.get("mounts", [])]
               + [parse_mount(spec, args.force) for spec in args.mount])
     guard_overlays(mounts)
     guard_bwrap_overlay(mounts)
@@ -597,16 +599,25 @@ def read_table(path, label):
         raise SystemExit(f"malformed {label}: {error}")
 
 
-def dump_table(table):
-    """Emit what the config holds, which is a flat table of strings.
+def dump_string(value):
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
-    tomllib only reads, and a whole TOML writer to put three settings back is
-    more than the three settings are worth.
+
+def dump_table(table):
+    """Emit what the config holds, which is a flat table of strings and lists
+    of strings.
+
+    tomllib only reads, and a whole TOML writer to put a few settings back is
+    more than the settings are worth.
     """
     lines = []
     for key, value in table.items():
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'{key} = "{escaped}"\n')
+        if isinstance(value, list):
+            rendered = "[" + ", ".join(dump_string(item) for item in value) + "]"
+        else:
+            rendered = dump_string(value)
+        lines.append(f"{key} = {rendered}\n")
     return "".join(lines)
 
 
@@ -658,6 +669,19 @@ def project_flags(project, args):
     for spec in project_env(project, args):
         flags += ["-e", spec]
     return flags
+
+
+def config_mounts(config):
+    mounts = config.get("mounts", [])
+    if not (isinstance(mounts, list) and all(isinstance(spec, str) for spec in mounts)):
+        raise SystemExit(f"'mounts' in '{CONFIG_PATH}' must be a list of strings")
+    for spec in mounts:
+        # The config applies to every project, so a relative path would name a
+        # different directory in each one.
+        if not Path(spec.split(":")[0]).expanduser().is_absolute():
+            raise SystemExit(f"invalid mount '{spec}' in '{CONFIG_PATH}': the host path must "
+                             f"be absolute or start with '~'")
+    return mounts
 
 
 def load_config():
@@ -736,7 +760,12 @@ def main():
         raise SystemExit("bwrap was not found on PATH; is bubblewrap installed?")
 
     project = read_project()
-    command = build_command(load_config(), project, args)
+    config = load_config()
+    command = build_command(config, project, args)
+    # Every project gets these, so they are the mounts most easily forgotten.
+    mounts = [flag for spec in config_mounts(config) for flag in ("-m", spec)]
+    if mounts:
+        print(f"{CONFIG_PATH}: {shlex.join(mounts)}", file=sys.stderr)
     flags = project_flags(project, args)
     if flags:
         print(f"{PROJECT_FILE}: {shlex.join(flags)}", file=sys.stderr)
