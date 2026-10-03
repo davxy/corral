@@ -20,8 +20,9 @@ HOST_HOME=$(cd "$HOME" && pwd -P)
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/corral-test-XXXXXX")
 HOMETMP=$(mktemp -d "$HOST_HOME/.corral-test-XXXXXX")
 # A hidden directory shows a difference only where the sandbox would otherwise
-# show the host. $TMPDIR and $HOME are hidden in every sandbox already.
-VISIBLE=$(mktemp -d "$(dirname "$CORRAL_BIN")/.corral-test-XXXXXX")
+# show the host. $TMPDIR and $HOME are hidden in every sandbox already, and so
+# is a checkout under /home. CORRAL_TEST_VISIBLE names another parent.
+VISIBLE=$(mktemp -d "${CORRAL_TEST_VISIBLE:-$(dirname "$CORRAL_BIN")}/.corral-test-XXXXXX")
 SOCK=
 SOCKPID=
 DAEMONPID=
@@ -1067,7 +1068,7 @@ ln -sfn "$ZONE" "$VISIBLE/zone-link"
 reads() { probe "$PROJECT" "cat '$1' 2>/dev/null || echo gone" "${@:2}"; }
 
 if [ "$(reads "$ZONE/other/secret")" != secret ]; then
-    skip 'the hidden directory assertions' "the sandbox does not show $VISIBLE"
+    skip 'the hidden directory assertions' "the sandbox does not show $VISIBLE; set CORRAL_TEST_VISIBLE"
 else
     mount_config "hide = [\"$ZONE\"]"
     is 'a hidden directory is not readable' 'gone' \
@@ -1169,7 +1170,7 @@ shell_of() {
 }
 
 if [ "$(reads "$FAKESHELL")" = gone ]; then
-    skip 'the shell assertions' "the sandbox does not show $VISIBLE"
+    skip 'the shell assertions' "the sandbox does not show $VISIBLE; set CORRAL_TEST_VISIBLE"
 else
     started=$(SHELL="$FAKESHELL" shell_start)
     has 'the interactive start runs $SHELL as a login shell' 'fakeshell -l' "$started"

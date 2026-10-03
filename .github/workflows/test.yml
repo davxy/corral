@@ -49,7 +49,11 @@ jobs:
         run: python3 -m py_compile corral
 
       - name: Run the property suite
-        run: ./tests/corral-test
+        # The checkout is under /home, which corral hides, so the tests of
+        # hidden directories and of the shell need a parent that it shows.
+        run: |
+          sudo install -d -o "$USER" /srv/corral-test
+          CORRAL_TEST_VISIBLE=/srv/corral-test ./tests/corral-test
 
       - name: Install with pipx and run the installed script
         # Nothing else reads the pyproject.toml, so this is where a broken one

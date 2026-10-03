@@ -324,7 +324,9 @@ $ ./tests/corral-test
 
 The suite needs `bwrap` and no config. It removes its temporary files at exit.
 The `private` tests skip when `pasta` cannot run, for example inside corral,
-and the `:tmp` tests skip with `bwrap` older than 0.11.0.
+and the `:tmp` tests skip with `bwrap` older than 0.11.0. The tests of hidden
+directories need a directory that the sandbox shows. With a checkout under
+`/home`, set `CORRAL_TEST_VISIBLE` to a writable directory elsewhere.
 
 CI uses `ubuntu-26.04`, because `ubuntu-latest` has `bubblewrap` 0.9.0, and
 sets the AppArmor user namespace sysctl to 0 first.
