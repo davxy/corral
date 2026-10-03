@@ -31,6 +31,5 @@ mounts = [
 # prints these on stderr, so forward a secret by name.
 env = [
     "RUST_LOG=debug",
-    "GITHUB_TOKEN",
     "GH_TOKEN=$(pass github/token)",
 ]
