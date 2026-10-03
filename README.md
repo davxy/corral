@@ -1,8 +1,11 @@
 # CORRAL
 
-Limit the blast radius of agents, builds and scripts. A program can write only
-to the current directory, it sees the rest of the host read only, and your
-home is hidden. There is no daemon, no image and no container, and no root.
+Limit the blast radius of agents, builds and scripts.
+
+A program can write only to the current directory, it sees the rest of the
+host read only, and your home is hidden. There is no daemon, no image and
+no container, and no root.
+
 Linux only.
 
 ## Usage
@@ -316,21 +319,6 @@ boundary against hostile code.
 - `none` still resolves names through the unix socket of the host resolver.
 - The hostname `corral` does not resolve when `nsswitch.conf` puts `resolve`
   before `files`. Some tools warn.
-
-## Tests
-
-```
-$ ./tests/corral-test
-```
-
-The suite needs `bwrap` and no config. It removes its temporary files at exit.
-The `private` tests skip when `pasta` cannot run, for example inside corral,
-and the `:tmp` tests skip with `bwrap` older than 0.11.0. The tests of hidden
-directories need a directory that the sandbox shows. With a checkout under
-`/home`, set `CORRAL_TEST_VISIBLE` to a writable directory elsewhere.
-
-CI uses `ubuntu-26.04`, because `ubuntu-latest` has `bubblewrap` 0.9.0, and
-sets the AppArmor user namespace sysctl to 0 first.
 
 ## License
 
