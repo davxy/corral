@@ -612,8 +612,8 @@ isnt 'an unknown option before the command fails' '0' "$PSTATUS"
 has  'the failure names the option' '--bogus' "$ERR_OUT"
 corral_err "$PROJECT" -x true
 isnt '-x is gone' '0' "$PSTATUS"
-corral_err "$PROJECT" --dry-run
-is  'no command starts the login shell' 'bash -l' "${ERR_OUT##*-- }"
+SHELL=/bin/bash corral_err "$PROJECT" --dry-run
+is  'no command starts the login shell' '/bin/bash -l' "${ERR_OUT##*-- }"
 corral_err "$PROJECT" --dry-run true
 is  'a command replaces the login shell' 'bash -lc true' "${ERR_OUT##*-- }"
 
@@ -807,7 +807,7 @@ toml_keys() {
     python3 -c 'import sys, tomllib
 print(" ".join(sorted(tomllib.load(open(sys.argv[1], "rb")))))' "$1" 2>&1
 }
-is 'the example config names every key' 'default_user env hide homes mounts network' \
+is 'the example config names every key' 'default_user env hide homes mounts network shell' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 # The version is in three files, and a release has to change all of them.
@@ -1135,6 +1135,75 @@ fi
 mount_config 'hide = ["/"]'
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'hiding / is refused' '0' "$PSTATUS"
+
+
+section 'the shell'
+
+# corral started 'bash -l' for every user, and its passwd said /bin/bash while
+# SHELL came from the host: Claude Code and tmux started one shell, and tools
+# that read passwd another. The interactive shell is now the 'shell' key, else
+# $SHELL, else bash, and passwd and SHELL name it. A command still runs in
+# 'bash -lc', because bash quotes the arguments exactly and fish does not.
+# The test shell has to be where the sandbox shows the host.
+FAKESHELL="$VISIBLE/fakeshell"
+OTHERSHELL="$VISIBLE/othershell"
+for shell in "$FAKESHELL" "$OTHERSHELL"; do
+    cat > "$shell" <<'EOF'
+#!/bin/sh
+echo __B__
+echo "$(basename "$0") $*"
+echo "SHELL=$SHELL"
+echo "passwd=$(getent passwd "$(id -u)" | cut -d: -f7)"
+echo __E__
+EOF
+    chmod +x "$shell"
+done
+# shell_start [corral args...] - what the interactive shell printed.
+shell_start() {
+    (cd "$PROJECT" && "$CORRAL_BIN" "$@" </dev/null 2>&1) | sed -n '/^__B__$/,/^__E__$/{//!p;}'
+}
+# shell_of [corral args...] - the program that the interactive start runs.
+shell_of() {
+    (cd "$PROJECT" && "$CORRAL_BIN" --dry-run "$@" 2>/dev/null) | awk '{ print $(NF - 1) }'
+}
+
+if [ "$(reads "$FAKESHELL")" = gone ]; then
+    skip 'the shell assertions' "the sandbox does not show $VISIBLE"
+else
+    started=$(SHELL="$FAKESHELL" shell_start)
+    has 'the interactive start runs $SHELL as a login shell' 'fakeshell -l' "$started"
+    has 'SHELL inside names it' "SHELL=$FAKESHELL" "$started"
+    has 'and so does passwd' "passwd=$FAKESHELL" "$started"
+    has 'a command still runs in bash' "-- bash -lc 'echo hi'" \
+        "$(cd "$PROJECT" && SHELL="$FAKESHELL" "$CORRAL_BIN" --dry-run echo hi 2>/dev/null)"
+
+    mount_config "shell = \"$OTHERSHELL\""
+    has 'the shell key beats $SHELL' 'othershell -l' \
+        "$(SHELL="$FAKESHELL" XDG_CONFIG_HOME="$MCFG" shell_start)"
+    is  'SHELL inside names the chosen shell for a command too' "$OTHERSHELL" \
+        "$(SHELL="$FAKESHELL" XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo "$SHELL"')"
+
+    # $SHELL comes from the environment, so one that the sandbox cannot run
+    # falls back to bash: an error would stop every start.
+    cp "$FAKESHELL" "$HOMETMP/fakeshell"
+    is 'a $SHELL under a hidden directory falls back to bash' '/bin/bash' \
+       "$(SHELL="$HOMETMP/fakeshell" shell_of)"
+    is 'so does a $SHELL that does not exist' '/bin/bash' "$(SHELL="$TMP/absent" shell_of)"
+    is 'so does a relative $SHELL' '/bin/bash' "$(SHELL=fakeshell shell_of)"
+    is 'so does an unset $SHELL' '/bin/bash' "$(env -u SHELL "$CORRAL_BIN" --dry-run 2>/dev/null \
+                                               | awk '{ print $(NF - 1) }')"
+
+    # The key is the user's own choice, so a bad one is an error.
+    for bad in "$HOMETMP/fakeshell" "$TMP/absent" fakeshell "$VISIBLE"; do
+        mount_config "shell = \"$bad\""
+        XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+        isnt "a shell key of '${bad##*/}' is refused" '0' "$PSTATUS"
+    done
+    has 'the refusal names the key' "'shell'" "$ERR_OUT"
+    mount_config 'shell = ["/bin/bash"]'
+    XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
+    isnt 'a shell key that is not a string is refused' '0' "$PSTATUS"
+fi
 
 
 section 'lifecycle'

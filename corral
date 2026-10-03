@@ -212,7 +212,7 @@ def generated_dir(homes, username):
     return homes / ".corral" / username
 
 
-def generated_etc(directory, username, guest_home):
+def generated_etc(directory, username, guest_home, shell):
     """The /etc files that have to describe the sandbox rather than the host.
 
     The sandbox runs as the caller's own uid and gid, under the sandbox user's
@@ -229,7 +229,7 @@ def generated_etc(directory, username, guest_home):
 
     files = {
         "/etc/passwd": replaced("/etc/passwd", uid,
-                                f"{username}:x:{uid}:{gid}::{guest_home}:/bin/bash"),
+                                f"{username}:x:{uid}:{gid}::{guest_home}:{shell}"),
         "/etc/group": replaced("/etc/group", gid, f"{username}:x:{gid}:"),
     }
     written = {}
@@ -360,6 +360,28 @@ def tty_filter(machine):
     return b"".join(program)
 
 
+def choose_shell(config, hidden):
+    """The interactive shell: the 'shell' key, else $SHELL, else bash.
+
+    $SHELL comes from the environment and was not chosen for corral, so one
+    that the sandbox cannot run falls back to bash. A bad key is an error.
+    """
+    def runnable(shell):
+        path = Path(shell).expanduser()
+        resolved = path.resolve()
+        return (path.is_absolute() and resolved.is_file() and os.access(resolved, os.X_OK)
+                and not any(root in resolved.parents for root in hidden + list(SCRATCH)))
+
+    if "shell" in config:
+        shell = config["shell"]
+        if not (isinstance(shell, str) and runnable(shell)):
+            raise SystemExit(f"invalid 'shell' in '{CONFIG_PATH}': expected the absolute path of "
+                             f"a program that the sandbox shows")
+        return str(Path(shell).expanduser())
+    shell = os.environ.get("SHELL", "")
+    return shell if shell and runnable(shell) else "/bin/bash"
+
+
 def inside_project(target):
     return target == CWD or CWD in target.parents
 
@@ -373,6 +395,7 @@ def build_command(config, project, args):
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
     hidden_files, hidden_directories = hidden_paths(config)
+    shell = choose_shell(config, hidden_directories)
     guest_home = Path("/home").resolve() / username
 
     network = args.net or project.get("network") or config.get("network") or DEFAULT_NETWORK
@@ -468,7 +491,7 @@ def build_command(config, project, args):
 
     # After the overlays in turn: '-m /etc::tmp' would otherwise bury these two
     # and the sandbox would answer getpwuid() with the caller's host entry.
-    for guest, path in generated_etc(generated, username, guest_home).items():
+    for guest, path in generated_etc(generated, username, guest_home, shell).items():
         command += ["--ro-bind", str(path), guest]
 
     seccomp = tty_filter(platform.machine())
@@ -509,6 +532,7 @@ def build_command(config, project, args):
         "--setenv", "HOME", str(guest_home),
         "--setenv", "USER", username,
         "--setenv", "LOGNAME", username,
+        "--setenv", "SHELL", shell,
         "--setenv", "PATH", path,
         # The only reliable way to tell from inside that this is a sandbox.
         # USER and the hostname can both be anything, so a shell prompt, a
@@ -546,8 +570,10 @@ def build_command(config, project, args):
     if seccomp:
         command += ["--seccomp", "3"]
 
+    # A command runs in bash whatever the shell, because the command is quoted
+    # for a POSIX shell, and fish reads a backslash in quotes in another way.
     command += (["--", "bash", "-lc", shlex.join(args.command)] if args.command
-                else ["--", "bash", "-l"])
+                else ["--", shell, "-l"])
 
     if seccomp:
         # pasta closes every inherited file descriptor, so the filter is opened

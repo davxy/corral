@@ -84,6 +84,7 @@ key.
 | `mounts` | mounts for every sandbox, same syntax as `-m` |
 | `env` | variables for every sandbox, same syntax as `-e` |
 | `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
+| `shell` | interactive shell, default `$SHELL`, see [Running a command](#running-a-command) |
 
 The file is optional. Without it, or without a key, corral uses the defaults:
 `~/.local/share/corral/homes`, the user `corral` and the network `private`.
@@ -386,8 +387,16 @@ corral cargo test -- --nocapture
 ```
 
 The command starts at the first argument that is not a corral option. Put `--`
-before a command that starts with a dash. The command runs in a login shell,
+before a command that starts with a dash. The command runs in `bash -lc`,
 and its exit status is the exit status of corral.
+
+Without a command, corral starts the `shell` key of the config as a login
+shell. Without the key, it starts `$SHELL`, or `/bin/bash` when the sandbox
+cannot run `$SHELL`, for example a shell under your hidden home. The generated
+`passwd` and `SHELL` name the same shell. A command uses bash with any shell:
+the command is quoted for a POSIX shell, and fish reads a backslash in quotes
+in another way. Your shell setup is in your real home, so a new sandbox home
+does not have it. Mount it, for example `-m ~/.config/fish:~/.config/fish`.
 
 ## Uid and capabilities
 

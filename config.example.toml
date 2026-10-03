@@ -14,6 +14,11 @@ default_user = "corral"
 # "private", "host" or "none".
 network = "private"
 
+# The interactive shell, also in the generated passwd and in SHELL. Without the
+# key, $SHELL of the host, or /bin/bash when the sandbox cannot run $SHELL. A
+# command after the options runs in 'bash -lc' with any shell.
+shell = "/usr/bin/fish"
+
 # Mounts for every sandbox, as HOST[:GUEST[:ro|rw|tmp]], the same as -m.
 # HOST must be absolute or start with '~'. GUEST defaults to HOST, and the
 # mode defaults to "ro". In GUEST, '~' is the sandbox home, so the "rw" entry
