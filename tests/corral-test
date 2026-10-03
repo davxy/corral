@@ -240,6 +240,18 @@ has  'the failure names the source' 'does not exist' "$ERR_OUT"
 corral_err "$PROJECT" -m "$TMP/sibling:relative" true
 isnt 'a relative guest path fails' '0' "$PSTATUS"
 has  'the failure asks for an absolute path' 'absolute path' "$ERR_OUT"
+# '~' as the guest path is the sandbox home, so one spec puts a directory in
+# the home of whichever user runs. Your own home is not even mounted inside.
+is 'a guest path under ~ lands in the sandbox home' 'shared' \
+   "$(probe "$PROJECT" 'cat /home/corral/sib/file' -m "$TMP/sibling:~/sib")"
+is 'and follows the sandbox user' 'shared' \
+   "$(probe "$PROJECT" 'cat /home/other/sib/file' -m "$TMP/sibling:~/sib" -u other)"
+probe "$PROJECT" 'echo out > ~/data/from-home' -m "$TMP/data:~/data:rw" >/dev/null
+is 'a rw mount under ~ lands on the host' 'out' "$(cat "$TMP/data/from-home" 2>&1)"
+is 'its mount point stays in the sandbox home on the host, empty' '' \
+   "$(ls -A "$TMP/homes/corral/data" 2>&1)"
+corral_err "$PROJECT" -m "$TMP/sibling:~other/sib" true
+isnt "a guest path under another user's ~ fails" '0' "$PSTATUS"
 corral_err "$PROJECT" -m "$TMP/sibling:/x:rx" true
 isnt 'an unknown mount mode fails' '0' "$PSTATUS"
 has  'the failure lists the modes' "expected 'ro', 'rw' or 'tmp'" "$ERR_OUT"
@@ -655,6 +667,12 @@ project_file 'mounts = ["../sibling::rw"]'
 is 'a project file mount on the same target beats the config' 'wrote' \
    "$(XDG_CONFIG_HOME="$MCFG" probe "$FPROJECT" 'touch '"$TMP"'/sibling/from-file && echo wrote')"
 project_file
+
+# The shared folder: one config line, the same directory in every home.
+mount_config "mounts = [\"$TMP/data:~/shared:rw\"]"
+XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'echo from-corral > ~/shared/note' >/dev/null
+is 'a config mount under ~ is shared by every sandbox user' 'from-corral' \
+   "$(XDG_CONFIG_HOME="$MCFG" probe "$PROJECT" 'cat ~/shared/note' -u other)"
 
 echo in-home > "$HOMETMP/file"
 mount_config "mounts = [\"~/${HOMETMP#"$HOST_HOME"/}\"]"

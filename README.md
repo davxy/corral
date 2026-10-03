@@ -331,13 +331,20 @@ corral -m /run/user/1000/gnupg/S.gpg-agent.ssh -e SSH_AUTH_SOCK
 corral -m ../core                  # read only, same path inside
 corral -m /data/sets:/data:rw      # writable, at a chosen path
 corral -m ../core -m ../docs       # repeatable
+corral -m ~/notes:~/notes:rw       # into the sandbox home
 ```
 
 GUEST defaults to the host path, mirrored the same way the project directory
 is, so a relative reference such as a cargo path dependency on `../core` keeps
-resolving inside. A GUEST that is given must be absolute. Mounts are read only
-unless `:rw` is appended, or `:tmp` for
+resolving inside. A GUEST that is given must be absolute or start with `~`.
+Mounts are read only unless `:rw` is appended, or `:tmp` for
 [writes that go nowhere](#writes-that-go-nowhere).
+
+The two sides read `~` differently. In HOST it is your own home, and in GUEST
+it is the sandbox home, `/home/<user>`, so one spec fits every sandbox user.
+`~name` is refused in GUEST. A mount point under `~` that does not exist yet is
+created in the sandbox home on the host, and it stays there, empty, after the
+sandbox exits.
 
 The source has to exist, and the refusal of `$HOME` and `/` applies to mount
 sources too, with `--force` overriding it as usual. A mount that one project
@@ -640,7 +647,7 @@ visible nor reachable through shared memory.
 
 ## Tests
 
-`tests/corral-test` asserts 231 properties of the sandbox: what is writable,
+`tests/corral-test` asserts 237 properties of the sandbox: what is writable,
 what is hidden, that each network mode differs from the others, that the host
 agent socket is out of reach, that a project under `/home` survives the tmpfs
 that empties it, that a mount inside the project takes effect, that a

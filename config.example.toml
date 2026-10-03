@@ -12,9 +12,12 @@ network = "private"
 
 # Mounts for every sandbox, as HOST[:GUEST[:ro|rw|tmp]], the same as -m.
 # HOST must be absolute or start with '~'. GUEST defaults to HOST, and the
-# mode defaults to "ro". Every start prints these on stderr.
+# mode defaults to "ro". In GUEST, '~' is the sandbox home, so the "rw" entry
+# below is one directory that every sandbox user shares. Every start prints
+# these on stderr.
 mounts = [
     "~/datasets:/data:ro",
+    "~/.local/share/corral/shared:~/shared:rw",
     "/srv/cache:/cache:rw",
     "/etc/ssl::tmp",
 ]

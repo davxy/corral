@@ -95,7 +95,7 @@ def ask_config_choice(config, key, prompt, modified, choices, default):
         print(f"Expected one of: {listed}")
 
 
-def parse_mount(spec, force, remedy=FORCE_REMEDY):
+def parse_mount(spec, guest_home, force, remedy=FORCE_REMEDY):
     parts = spec.split(":")
     if not 1 <= len(parts) <= 3:
         raise SystemExit(f"invalid mount '{spec}': expected HOST[:GUEST[:ro|rw|tmp]]")
@@ -105,8 +105,12 @@ def parse_mount(spec, force, remedy=FORCE_REMEDY):
     if mode not in ("ro", "rw", "tmp"):
         raise SystemExit(f"invalid mount mode '{mode}' in '{spec}': "
                          f"expected 'ro', 'rw' or 'tmp'")
+    # '~' is the sandbox home, so that one spec suits every sandbox user.
+    if guest == "~" or guest.startswith("~/"):
+        guest = str(guest_home) + guest[1:]
     if guest and not guest.startswith("/"):
-        raise SystemExit(f"invalid mount target '{guest}' in '{spec}': expected an absolute path")
+        raise SystemExit(f"invalid mount target '{guest}' in '{spec}': expected an absolute "
+                         f"path or one under '~'")
 
     source = Path(host).expanduser().resolve()
     if not source.exists():
@@ -264,6 +268,7 @@ def build_command(config, project, args):
     username = args.user or project.get("user") or config.get("default_user") or DEFAULT_USER
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
+    guest_home = Path("/home") / username
 
     network = args.net or project.get("network") or config.get("network") or DEFAULT_NETWORK
     if network not in NETWORKS:
@@ -273,9 +278,11 @@ def build_command(config, project, args):
                          "Install it, or pass '-n host' to share the host's network.")
 
     guard_path(CWD, args.force, f"refusing to start in '{CWD}'")
-    mounts = ([parse_mount(spec, False, CONFIG_REMEDY) for spec in config_mounts(config)]
-              + [parse_mount(spec, False, PROJECT_REMEDY) for spec in project.get("mounts", [])]
-              + [parse_mount(spec, args.force) for spec in args.mount])
+    mounts = ([parse_mount(spec, guest_home, False, CONFIG_REMEDY)
+               for spec in config_mounts(config)]
+              + [parse_mount(spec, guest_home, False, PROJECT_REMEDY)
+                 for spec in project.get("mounts", [])]
+              + [parse_mount(spec, guest_home, args.force) for spec in args.mount])
     guard_overlays(mounts)
     guard_bwrap_overlay(mounts)
     variables = [parse_env(spec) for spec in project_env(project, args) + args.env]
@@ -291,7 +298,6 @@ def build_command(config, project, args):
 
     generated = generated_dir(homes, username)
     generated.mkdir(parents=True, exist_ok=True)
-    guest_home = Path("/home") / username
 
     # '/home' is replaced wholesale so that no real home survives, which means
     # every later bind under it has to come after this one.
