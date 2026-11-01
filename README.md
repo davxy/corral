@@ -208,6 +208,35 @@ your home. In GUEST, `~` is the sandbox home.
 A missing mount point is created. In the project and the sandbox home, it stays
 on the host after exit. Elsewhere, its parent must exist on the host.
 
+## Tools in your home
+
+Your real home is hidden, so the tools that you installed there are not in a
+new sandbox home: rustup, nvm, uv and pipx tools, the native `claude`
+installer, and your `~/.gitconfig`. Install them again in the sandbox. The
+installers write to `$HOME`, and `PATH` already has `~/.local/bin` and
+`~/.cargo/bin`:
+
+```
+corral
+curl -fsSL https://claude.ai/install.sh | bash
+curl -sSf https://sh.rustup.rs | sh
+git config --global user.name "Your Name"
+```
+
+Each sandbox user keeps its own copy. To use the copy from your real home in
+every sandbox, add a read-only mount to the config:
+
+```toml
+mounts = [
+    "~/.gitconfig:~/.gitconfig",   # git config --global then fails
+    "/home/linuxbrew",             # also add 'brew shellenv' to the sandbox .bashrc
+]
+```
+
+Mount only what the sandbox needs. A mount of `~/.config` or `~/.local` also
+gives it the tokens there, and a writable mount lets it change a program that
+you later run outside the sandbox.
+
 ## `:tmp` mounts
 
 ```
