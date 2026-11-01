@@ -1593,6 +1593,217 @@ if command -v cryfs >/dev/null && command -v fusermount >/dev/null && [ -c /dev/
     has 'and the bwrap command after it' 'bwrap' "$(printf '%s\n' "$out" | sed -n 2p)"
     is  '--dry-run mounts nothing' 'locked' "$(state)"
     is  'and puts nothing into the mount point' '' "$(ls -A "$LOCKED")"
+
+    # sleeper SECONDS [corral args...] - a background sandbox that sleeps, with
+    # corral as $BGPID. False when a stale one is there or it does not start.
+    sleeper() {
+        sleeping "$1" && return 1
+        (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" exec "$CORRAL_BIN" -p "${@:2}" sleep "$1") \
+            >/dev/null 2>&1 &
+        BGPID=$!
+        await_sleep "$1" && return 0
+        reap "$BGPID"
+        return 1
+    }
+    # end_sleeper SECONDS - end that sandbox and wait for its corral.
+    end_sleeper() { kill "$(pgrep -f "^sleep $1\$")"; reap "$BGPID"; }
+    # size DIR - what corral prints for the disk usage of DIR.
+    size() {
+        python3 - "$CORRAL_BIN" "$1" <<'PY'
+import sys
+from pathlib import Path
+corral = {"__name__": "corral"}
+exec(open(sys.argv[1]).read(), corral)
+print(corral["format_size"](corral["disk_usage"](Path(sys.argv[2]))))
+PY
+    }
+    daemon() { pgrep -f "^cryfs $CIPHER " >/dev/null; }
+
+    # 'cryfs-unmount' by hand is a lazy unmount: it takes the mount point away
+    # under a running sandbox, and the daemon lives on through the sandbox's
+    # bind. cryfs would mount the same cipher directory a second time without
+    # a word, and two daemons corrupt it, so the start refuses until the
+    # first is gone.
+    if sleeper 31702 -u locked; then
+        cryfs-unmount "$LOCKED" >/dev/null 2>&1
+        is   'cryfs-unmount by hand takes the mount away under the sandbox' 'locked' "$(state)"
+        XDG_CONFIG_HOME="$ENCCFG" corral_err "$PROJECT" -u locked true
+        isnt 'a start refuses a cipher directory that a detached cryfs serves' '0' "$PSTATUS"
+        has  'and the refusal names the cipher directory' "'$CIPHER'" "$ERR_OUT"
+        is   'and there is one cryfs on it, not two' '1' "$(pgrep -fc "^cryfs $CIPHER ")"
+        end_sleeper 31702
+        for _ in $(seq 50); do daemon || break; sleep 0.1; done
+        is   'the daemon ends with the sandbox' 'gone' "$(daemon && echo there || echo gone)"
+        is   'and the next start works' 'plain' "$(enc 'cat ~/plain')"
+    else
+        bad 'a start refuses a cipher directory that a detached cryfs serves' 'the sandbox never started'
+    fi
+
+    # 'encrypt USER' moves a plain home into a cipher directory: a copy, read
+    # back after a fresh mount and compared, and only then the deletion of the
+    # plain files. A socket or a pipe stays out, cryfs cannot hold them, and a
+    # hard link becomes a file of its own.
+    TURNED="$TMP/homes/turned"
+    mkdir -p "$TURNED/.config/app"
+    echo plaintext-marker-2718 > "$TURNED/.config/app/settings"
+    chmod 600 "$TURNED/.config/app/settings"
+    touch -d '2020-02-02 02:02:02' "$TURNED/.config/app/settings"
+    ln -s .config/app/settings "$TURNED/link"
+    ln "$TURNED/.config/app/settings" "$TURNED/hardlink"
+    mkfifo "$TURNED/pipe"
+    python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$TURNED/sock"
+    echo secret2 > "$TMP/keys/turned"
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt turned 2>&1); status=$?
+    is  'encrypt succeeds on a plain home' '0' "$status"
+    has 'and names the cipher directory' "$TMP/homes/.turned.cryfs" "$out"
+    has 'and counts what it left out' 'Left out 2 ' "$out"
+    is  'the home is an empty mount point now' '' "$(ls -A "$TURNED")"
+    is  'no plain copy of the content remains under the homes root' '' \
+        "$(grep -rl plaintext-marker-2718 "$TMP/homes" 2>/dev/null)"
+    is  'the temporary mount point is gone' 'gone' \
+        "$([ -e "$TMP/homes/.turned.mount" ] && echo there || echo gone)"
+    is  'and nothing of it stays mounted' '' "$(grep -o "$TMP/homes/\.turned[^ ]*" /proc/self/mountinfo)"
+    is  'the files are inside, with their mode and time' 'plaintext-marker-2718 600 2020-02-02' \
+        "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'cd .config/app && echo "$(cat settings) $(stat -c %a settings) $(date -r settings +%F)"' -u turned)"
+    is  'a symbolic link keeps its target' '.config/app/settings' \
+        "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'readlink link' -u turned)"
+    is  'a hard link is a file with the content' 'plaintext-marker-2718' \
+        "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'cat hardlink' -u turned)"
+    is  'the socket and the pipe stayed out' 'none' \
+        "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" '{ [ -e sock ] || [ -e pipe ]; } && echo some || echo none' -u turned)"
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt turned 2>&1); status=$?
+    is  'encrypt of an encrypted home does nothing' '0' "$status"
+    has 'and says so' 'already encrypted' "$out"
+
+    echo secret3 > "$TMP/keys/newborn"
+    (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt newborn >/dev/null 2>&1); status=$?
+    is 'encrypt works for a user that never started' '0' "$status"
+    is 'and the first start has a writable home' 'hi' \
+       "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'echo hi > ~/hi && cat ~/hi' -u newborn)"
+
+    # Without a key command the passphrase is asked twice, and it is the one
+    # the home opens with afterwards.
+    typed() { (cd "$PROJECT" && XDG_CONFIG_HOME="$TMP/nokey-config" setsid -w "$CORRAL_BIN" "$@" 2>&1); }
+    out=$(printf 'one\ntwo\n' | typed encrypt typed); status=$?
+    isnt 'encrypt refuses passphrases that differ' '0' "$status"
+    has  'and says so' 'differ' "$out"
+    is   'and makes no cipher directory' 'gone' \
+         "$([ -e "$TMP/homes/.typed.cryfs" ] && echo there || echo gone)"
+    out=$(printf '\n\n' | typed encrypt typed); status=$?
+    isnt 'encrypt refuses an empty passphrase' '0' "$status"
+    has  'and says so' 'empty' "$out"
+    printf 'pw\npw\n' | typed encrypt typed >/dev/null; status=$?
+    is   'encrypt takes the passphrase from the terminal, twice' '0' "$status"
+    printf 'pw\n' | typed -u typed sh -c 'echo typed > ~/typed' >/dev/null
+    echo pw > "$TMP/keys/typed"
+    is   'and the home opens with that passphrase' 'typed' \
+         "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'cat ~/typed' -u typed)"
+
+    # A sandbox that runs would write into a home that is about to go.
+    mkdir -p "$TMP/homes/busy"
+    echo busy > "$TMP/homes/busy/file"
+    echo secret4 > "$TMP/keys/busy"
+    if sleeper 31703 -u busy; then
+        out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt busy 2>&1); status=$?
+        isnt 'encrypt refuses while a sandbox of the user runs' '0' "$status"
+        has  'and says so' 'runs' "$out"
+        is   'and the home is untouched' 'busy' "$(cat "$TMP/homes/busy/file")"
+        is   'and no cipher directory appeared' 'gone' \
+             "$([ -e "$TMP/homes/.busy.cryfs" ] && echo there || echo gone)"
+        end_sleeper 31703
+    else
+        bad 'encrypt refuses while a sandbox of the user runs' 'the sandbox never started'
+    fi
+
+    # A failure before the deletion undoes the attempt, and the plain home is
+    # what it was. An attempt that was killed leaves its temporary mount
+    # point, and the next one says so rather than build on it.
+    mkdir -p "$TMP/homes/sealed"
+    echo open > "$TMP/homes/sealed/open"
+    echo shut > "$TMP/homes/sealed/shut"
+    chmod 000 "$TMP/homes/sealed/shut"
+    echo secret5 > "$TMP/keys/sealed"
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt sealed 2>&1); status=$?
+    isnt  'a file that cannot be read stops encrypt' '0' "$status"
+    has   'and the message names it' 'shut' "$out"
+    hasnt 'without a traceback' 'Traceback' "$out"
+    is    'and the plain home is intact' 'open' "$(cat "$TMP/homes/sealed/open")"
+    is    'and the cipher directory is gone again' 'gone' \
+          "$([ -e "$TMP/homes/.sealed.cryfs" ] && echo there || echo gone)"
+    is    'and nothing stays mounted' '' "$(grep -o "$TMP/homes/\.sealed[^ ]*" /proc/self/mountinfo)"
+    chmod 600 "$TMP/homes/sealed/shut"
+    # cryfs remembers the filesystem of a directory and refuses a new one
+    # there, so a second attempt has to say that it replaces the first.
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt sealed 2>&1); status=$?
+    is    'and the next attempt succeeds' '0' "$status"
+    # The comparison is what stands between the copy and the deletion, so it
+    # has to see a changed file, a changed link and a missing entry.
+    differs() {
+        python3 - "$CORRAL_BIN" "$1" "$2" <<'PY'
+import sys
+from pathlib import Path
+corral = {"__name__": "corral"}
+exec(open(sys.argv[1]).read(), corral)
+print(corral["first_difference"](Path(sys.argv[2]), Path(sys.argv[3])))
+PY
+    }
+    mkdir -p "$TMP/cmp/a/dir" "$TMP/cmp/b/dir"
+    echo same > "$TMP/cmp/a/dir/file"; cp -p "$TMP/cmp/a/dir/file" "$TMP/cmp/b/dir/file"
+    ln -s dir/file "$TMP/cmp/a/link"; ln -s dir/file "$TMP/cmp/b/link"
+    mkfifo "$TMP/cmp/a/pipe"
+    is 'the comparison passes a faithful copy, special files aside' 'None' "$(differs "$TMP/cmp/a" "$TMP/cmp/b")"
+    echo Same > "$TMP/cmp/b/dir/file"; touch -r "$TMP/cmp/a/dir/file" "$TMP/cmp/b/dir/file"
+    is 'and sees a changed byte behind the same size and time' 'dir/file' "$(differs "$TMP/cmp/a" "$TMP/cmp/b")"
+    cp -p "$TMP/cmp/a/dir/file" "$TMP/cmp/b/dir/file"; ln -sfn dir/other "$TMP/cmp/b/link"
+    is 'and a link that points elsewhere' 'link' "$(differs "$TMP/cmp/a" "$TMP/cmp/b")"
+    rm "$TMP/cmp/b/link"
+    is 'and a missing entry' 'link' "$(differs "$TMP/cmp/a" "$TMP/cmp/b")"
+
+    mkdir -p "$TMP/homes/half" "$TMP/homes/.half.cryfs" "$TMP/homes/.half.mount"
+    echo secret6 > "$TMP/keys/half"
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt half 2>&1); status=$?
+    isnt 'a leftover of a killed attempt stops encrypt' '0' "$status"
+    has  'and the message names it' "$TMP/homes/.half.mount" "$out"
+
+    # 'list' tells an encrypted home from a plain one and says whether it is
+    # unlocked now. Its size is what the cipher directory costs on disk.
+    LIST_OUT=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" list 2>&1)
+    has 'list has a STATE column' 'STATE' "$(printf '%s\n' "$LIST_OUT" | sed -n 1p)"
+    is  'a plain home is plain' 'plain' "$(row corral | awk '{ print $(NF - 1) }')"
+    is  'a locked home is locked' 'locked' "$(row locked | awk '{ print $(NF - 1) }')"
+    is  'and its size is that of the cipher directory' "$(size "$CIPHER")" "$(row locked | awk '{ print $2 }')"
+    printf 'secret\n' | CRYFS_FRONTEND=noninteractive CRYFS_NO_UPDATE_CHECK=true \
+        cryfs "$CIPHER" "$LOCKED" >/dev/null 2>&1
+    LIST_OUT=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" list 2>&1)
+    is  'an unlocked home is unlocked' 'unlocked' "$(row locked | awk '{ print $(NF - 1) }')"
+    fusermount -u "$LOCKED"
+
+    # 'remove' of an encrypted user unmounts, then takes the cipher directory
+    # as well. It refuses while a sandbox of the user runs.
+    if sleeper 31704 -u locked; then
+        out=$(printf 'y\n' | (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" remove locked 2>&1))
+        status=$?
+        isnt 'remove refuses while a sandbox of the user runs' '0' "$status"
+        has  'and says so' 'runs' "$out"
+        is   'and the cipher directory is still there' 'there' \
+             "$([ -d "$CIPHER" ] && echo there || echo gone)"
+        end_sleeper 31704
+    else
+        bad 'remove refuses while a sandbox of the user runs' 'the sandbox never started'
+    fi
+    printf 'secret\n' | CRYFS_FRONTEND=noninteractive CRYFS_NO_UPDATE_CHECK=true \
+        cryfs "$CIPHER" "$LOCKED" >/dev/null 2>&1
+    expected_size=$(size "$CIPHER")
+    out=$(printf 'y\n' | (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" remove locked 2>&1)); status=$?
+    is  'remove of an unlocked encrypted user succeeds' '0' "$status"
+    has 'the prompt gives the size of the cipher directory' "($expected_size)" "$out"
+    is  'the cipher directory is gone' 'gone' "$([ -e "$CIPHER" ] && echo there || echo gone)"
+    is  'and so is the mount point' 'gone' "$([ -e "$LOCKED" ] && echo there || echo gone)"
+    is  'and nothing stays mounted' '' "$(grep -o "$TMP/homes/locked" /proc/self/mountinfo)"
+    is  'and the generated files are gone' 'gone' \
+        "$([ -e "$TMP/homes/.corral/locked" ] && echo there || echo gone)"
+    (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" encrypt locked >/dev/null 2>&1); status=$?
+    is  'encrypt works again for a removed user' '0' "$status"
 else
     skip 'encrypted homes' 'cryfs, fusermount or /dev/fuse is missing'
 fi
@@ -1616,6 +1827,12 @@ for name in kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_use
     isnt "check reports $name" '' "$(line "$name")"
 done
 isnt  'check reports pasta' '' "$(line pasta)"
+if command -v cryfs >/dev/null; then
+    has 'check reports cryfs with its version' 'CryFS' "$(line cryfs)"
+    has 'as ok' 'ok' "$(line cryfs)"
+else
+    has 'a missing cryfs is a warning that names the package' 'cryfs package' "$(line cryfs)"
+fi
 hasnt 'nothing fails here' 'FAIL' "$CHECK_OUT"
 hasnt 'pasta is never a failure' 'FAIL' "$(line pasta)"
 corral_err "$PROJECT" check extra
@@ -1630,6 +1847,8 @@ has  'and says what to install' 'bubblewrap' "$(line bwrap)"
 has  'with the state spelled out' 'FAIL' "$(line bwrap)"
 has  'a missing pasta is a warning that names the package' 'passt' "$(line pasta)"
 has  'and a warning only' 'warn' "$(line pasta)"
+has  'a missing cryfs is a warning that names the package' 'cryfs package' "$(line cryfs)"
+has  'and a warning only' 'warn' "$(line cryfs)"
 
 # The AppArmor case: bwrap is there and the kernel refuses the namespace. The
 # probe's own error is what a bug report needs, so it is shown as is. An old

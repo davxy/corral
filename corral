@@ -3,6 +3,7 @@
 import argparse
 import ctypes
 import errno
+import filecmp
 import getpass
 import os
 import platform
@@ -237,13 +238,50 @@ def cipher_dir(homes, username):
     return homes / f".{username}.cryfs"
 
 
+def staging_dir(homes, username):
+    """The mount point of a cipher directory in the making."""
+    return homes / f".{username}.mount"
+
+
 def mounted(path):
     return any(Path(line.split()[4]) == path
                for line in Path("/proc/self/mountinfo").read_text().splitlines())
 
 
-def cryfs_command(homes, username):
-    return ["env", *CRYFS_ENV, "cryfs", str(cipher_dir(homes, username)), str(homes / username)]
+def process_with(*arguments):
+    """The command line of a process on the host that has ARGUMENTS in a row,
+    or None."""
+    wanted = list(arguments)
+    for cmdline in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = cmdline.read_bytes().decode(errors="replace").split("\0")
+        except OSError:
+            continue
+        for index in range(len(argv)):
+            if argv[index:index + len(wanted)] == wanted:
+                return argv
+    return None
+
+
+def cryfs_command(cipher, mount_point, *options):
+    return ["env", *CRYFS_ENV, "cryfs", *options, str(cipher), str(mount_point)]
+
+
+def mount_cipher(cipher, mount_point, passphrase, *options):
+    """cryfs makes a new filesystem when the cipher directory is empty."""
+    run = subprocess.run(cryfs_command(cipher, mount_point, *options), capture_output=True,
+                         text=True, input=passphrase + "\n")
+    # cryfs exits 0 when fuse refuses a mount point that is not empty.
+    if run.returncode != 0 or not mounted(mount_point):
+        said = (run.stderr.strip() or run.stdout.strip().rpartition("\n")[2]
+                or f"cryfs exited with {run.returncode}")
+        raise SystemExit(f"cannot mount '{cipher}' on '{mount_point}': {said}")
+
+
+def unmount(mount_point):
+    run = subprocess.run(["fusermount", "-u", str(mount_point)], capture_output=True, text=True)
+    if run.returncode != 0:
+        raise SystemExit(f"cannot unmount '{mount_point}': {run.stderr.strip()}")
 
 
 def read_passphrase(config, username):
@@ -261,21 +299,35 @@ def read_passphrase(config, username):
     return run.stdout.rstrip("\n")
 
 
+def new_passphrase(config, username):
+    passphrase = read_passphrase(config, username)
+    if not passphrase:
+        raise SystemExit("The passphrase is empty.")
+    if "key_command" not in config and getpass.getpass("Again: ") != passphrase:
+        raise SystemExit("The passphrases differ.")
+    return passphrase
+
+
 def unlock_home(homes, username, config):
-    """Mount the cipher directory on the home, unless it is mounted already."""
+    """Mount the cipher directory on the home, unless it is mounted already.
+
+    cryfs mounts a cipher directory a second time without a word, and two of
+    them corrupt it. A 'cryfs-unmount' by hand under a running sandbox leaves
+    exactly that: the mount point is gone, the daemon lives on through the
+    sandbox's bind.
+    """
     home = homes / username
     if mounted(home):
         return
+    cipher = cipher_dir(homes, username)
     if not shutil.which("cryfs"):
         raise SystemExit(f"the home of '{username}' is encrypted and needs 'cryfs'; is the cryfs "
                          f"package installed?")
-    run = subprocess.run(cryfs_command(homes, username), capture_output=True, text=True,
-                         input=read_passphrase(config, username) + "\n")
-    # cryfs exits 0 when fuse refuses a mount point that is not empty.
-    if run.returncode != 0 or not mounted(home):
-        said = (run.stderr.strip() or run.stdout.strip().rpartition("\n")[2]
-                or f"cryfs exited with {run.returncode}")
-        raise SystemExit(f"cannot unlock '{home}': {said}")
+    if process_with("cryfs", str(cipher)):
+        raise SystemExit(f"cryfs already serves '{cipher}', mounted elsewhere or detached under "
+                         f"a sandbox that still runs, and a second mount would corrupt it.\n"
+                         f"Exit that sandbox, or unmount it, and try again.")
+    mount_cipher(cipher, home, read_passphrase(config, username))
 
 
 def prepare_home(homes, username, config, dry_run):
@@ -290,11 +342,83 @@ def prepare_home(homes, username, config, dry_run):
         print(f"Created '{home}'.", file=sys.stderr)
     if cipher_dir(homes, username).is_dir():
         if dry_run:
-            print(shlex.join(cryfs_command(homes, username)))
+            print(shlex.join(cryfs_command(cipher_dir(homes, username), home)))
             return home
         unlock_home(homes, username, config)
     seed_home(home)
     return home
+
+
+def tree_entries(root):
+    """Every path under ROOT with its kind, links not followed."""
+    for directory, subdirectories, files in os.walk(root):
+        for name in subdirectories + files:
+            path = Path(directory, name)
+            if path.is_symlink():
+                kind = "link"
+            elif path.is_dir():
+                kind = "dir"
+            elif path.is_file():
+                kind = "file"
+            else:
+                kind = "special"
+            yield path.relative_to(root), kind
+
+
+def copy_tree(source, target):
+    """Copy SOURCE into TARGET. A hard link becomes a file of its own, and a
+    socket, pipe or device is left out: cryfs cannot hold them. Returns how
+    many were left out."""
+    skipped = 0
+    for relative, kind in tree_entries(source):
+        original, copy = source / relative, target / relative
+        if kind == "dir":
+            copy.mkdir()
+            shutil.copymode(original, copy)
+        elif kind == "link":
+            os.symlink(os.readlink(original), copy)
+        elif kind == "file":
+            shutil.copy2(original, copy)
+        else:
+            skipped += 1
+    return skipped
+
+
+def first_difference(source, copy):
+    """The first path whose copy is not the same, or None."""
+    for relative, kind in tree_entries(source):
+        original, copied = source / relative, copy / relative
+        if kind == "dir":
+            same = copied.is_dir()
+        elif kind == "link":
+            same = copied.is_symlink() and os.readlink(copied) == os.readlink(original)
+        elif kind == "file":
+            same = copied.is_file() and filecmp.cmp(original, copied, shallow=False)
+        else:
+            same = True
+        if not same:
+            return relative
+    return None
+
+
+def fill_cipher(home, cipher, staging, passphrase):
+    """Copy the home into the new cipher directory, and compare after a fresh
+    mount, so that what is compared comes from the blocks on disk and not from
+    the cache of cryfs."""
+    # cryfs remembers the filesystem it last saw in a directory and refuses
+    # another one there, which a new one after 'remove' or a failed attempt is.
+    mount_cipher(cipher, staging, passphrase, "--allow-replaced-filesystem")
+    try:
+        skipped = copy_tree(home, staging)
+    except OSError as error:
+        raise SystemExit(f"cannot encrypt '{home}': {error}")
+    unmount(staging)
+    mount_cipher(cipher, staging, passphrase)
+    different = first_difference(home, staging)
+    unmount(staging)
+    if different:
+        raise SystemExit(f"the copy of '{different}' differs from the original; nothing was deleted")
+    return skipped
 
 
 def generated_etc(directory, username, guest_home, shell):
@@ -773,11 +897,16 @@ def list_homes(rest):
         print(f"No sandbox homes under '{homes}'.")
         return
     width = max(len(name) for name in names + ["USER"])
-    print(f"{'USER':<{width}}  {'SIZE':>5}  {'LAST USED':<16}  HOME")
+    print(f"{'USER':<{width}}  {'SIZE':>5}  {'LAST USED':<16}  {'STATE':<8}  HOME")
     for name in names:
         home = homes / name
-        print(f"{name:<{width}}  {format_size(disk_usage(home)):>5}  "
-              f"{last_used(homes, name):<16}  {home}")
+        cipher = cipher_dir(homes, name)
+        if cipher.is_dir():
+            state, usage = "unlocked" if mounted(home) else "locked", disk_usage(cipher)
+        else:
+            state, usage = "plain", disk_usage(home)
+        print(f"{name:<{width}}  {format_size(usage):>5}  "
+              f"{last_used(homes, name):<16}  {state:<8}  {home}")
 
 
 def remove_home(rest):
@@ -789,17 +918,71 @@ def remove_home(rest):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
     homes = Path(expand_config(load_config())["homes"]).expanduser()
     home = homes / username
+    cipher = cipher_dir(homes, username)
     if home.is_symlink():
         raise SystemExit(f"refusing to remove '{home}': it is a symbolic link")
     if not home.is_dir():
         raise SystemExit(f"there is no '{username}' sandbox under '{homes}'")
-    if not ask_confirmation(f"Remove '{home}' ({format_size(disk_usage(home))})?"):
+    if process_with("--bind", str(home)):
+        raise SystemExit(f"a sandbox of '{username}' runs; exit it first.")
+    usage = disk_usage(cipher if cipher.is_dir() else home)
+    if not ask_confirmation(f"Remove '{home}' ({format_size(usage)})?"):
         raise SystemExit("Aborted.")
+    if mounted(home):
+        unmount(home)
     shutil.rmtree(home)
+    if cipher.is_dir():
+        shutil.rmtree(cipher)
     generated = generated_dir(homes, username)
     if generated.is_dir():
         shutil.rmtree(generated)
     print(f"Removed '{home}'.")
+
+
+def encrypt_home(rest):
+    parser = argparse.ArgumentParser(prog="corral encrypt",
+                                     description="Put a sandbox user's home under cryfs.")
+    parser.add_argument("user", help="the sandbox user whose home to encrypt")
+    username = parser.parse_args(rest).user
+    if not USERNAME_RE.match(username):
+        raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
+    config = expand_config(load_config())
+    homes = Path(config["homes"]).expanduser()
+    home = homes / username
+    cipher = cipher_dir(homes, username)
+    staging = staging_dir(homes, username)
+    if staging.exists():
+        raise SystemExit(f"'{staging}' is left from an attempt that was killed.\n"
+                         f"Unmount it if it is mounted, remove it and '{cipher}', then try again.")
+    if cipher.is_dir():
+        print(f"The home of '{username}' is already encrypted.")
+        return
+    if home.is_symlink():
+        raise SystemExit(f"refusing to encrypt '{home}': it is a symbolic link")
+    if mounted(home):
+        raise SystemExit(f"refusing to encrypt '{home}': something is mounted on it")
+    if not shutil.which("cryfs"):
+        raise SystemExit("encrypting a home needs 'cryfs'; is the cryfs package installed?")
+    if process_with("--bind", str(home)):
+        raise SystemExit(f"a sandbox of '{username}' runs; exit it first.")
+    passphrase = new_passphrase(config, username)
+    home.mkdir(parents=True, exist_ok=True)
+    cipher.mkdir()
+    staging.mkdir()
+    try:
+        skipped = fill_cipher(home, cipher, staging, passphrase)
+    except BaseException:
+        subprocess.run(["fusermount", "-u", str(staging)], capture_output=True)
+        shutil.rmtree(cipher, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    staging.rmdir()
+    shutil.rmtree(home)
+    home.mkdir()
+    print(f"Encrypted '{home}' into '{cipher}'.")
+    if skipped:
+        print(f"Left out {skipped} special file(s): a socket, a pipe or a device cannot live "
+              f"in cryfs.")
 
 
 def read_sysctl(name):
@@ -894,6 +1077,11 @@ def check_host(rest):
         else:
             rows.append(("pasta", WARN, f"{version}, cannot run: {error}; 'private' will "
                                         f"fail, so use -n host or -n none"))
+    if not shutil.which("cryfs"):
+        rows.append(("cryfs", WARN, "not on PATH; an encrypted home needs it, from the cryfs "
+                                    "package"))
+    else:
+        rows.append(("cryfs", OK, tool_version("cryfs")))
 
     width = max(len(subject) for subject, _, _ in rows)
     for subject, state, detail in rows:
@@ -1114,12 +1302,14 @@ def main():
         usage="corral [OPTION ...] [COMMAND [ARG ...]]\n"
               "       corral list\n"
               "       corral remove USER\n"
+              "       corral encrypt USER\n"
               "       corral check",
         description="Run a shell that sees the host read only and writes only to a home "
                     "of its own. With -p, the current directory is writable too.",
-        epilog=f"'list' shows the sandbox homes, 'remove' deletes one and 'check' reports "
-               f"what this host is missing; put '--' first to run a program by one of "
-               f"those names. Settings live in '{CONFIG_PATH}', which is optional. With "
+        epilog=f"'list' shows the sandbox homes, 'remove' deletes one, 'encrypt' puts one "
+               f"under cryfs and 'check' reports what this host is missing; put '--' first "
+               f"to run a program by one of those names. Settings live in '{CONFIG_PATH}', "
+               f"which is optional. With "
                f"-p, a '{PROJECT_FILE}' in the project adds flags for it.",
     )
     parser.add_argument("-p", "--project", action="store_true",
@@ -1157,7 +1347,8 @@ def main():
     # the program to run. Only the first one is corral's; a later one is the
     # command's own. It also makes a 'list', 'remove' or 'check' after it a
     # program to run rather than corral's own verb.
-    verbs = {"list": list_homes, "remove": remove_home, "check": check_host}
+    verbs = {"list": list_homes, "remove": remove_home, "encrypt": encrypt_home,
+             "check": check_host}
     if args.command[:1] == ["--"]:
         del args.command[0]
     elif args.command and args.command[0] in verbs:
