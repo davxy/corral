@@ -26,10 +26,12 @@ VISIBLE=$(mktemp -d "${CORRAL_TEST_VISIBLE:-$(dirname "$CORRAL_BIN")}/.corral-te
 SOCK=
 SOCKPID=
 DAEMONPID=
+DISPLAYPID=
 
 cleanup() {
     [ -n "$SOCKPID" ] && kill "$SOCKPID" 2>/dev/null
     [ -n "$DAEMONPID" ] && kill "$DAEMONPID" 2>/dev/null
+    [ -n "$DISPLAYPID" ] && kill "$DISPLAYPID" 2>/dev/null
     [ -n "$SOCK" ] && rm -f "$SOCK"
     rm -rf "$TMP" "$HOMETMP" "$VISIBLE"
 }
@@ -155,6 +157,51 @@ is 'XDG_CONFIG_HOME is dropped' 'unset' \
 path=$(probe "$PROJECT" 'echo "$PATH"' -u other)
 has   'PATH leads with the sandbox home' '/home/other/.local/bin:/home/other/.cargo/bin' "$path"
 hasnt 'PATH keeps nothing under the real home' "$HOST_HOME/" "$path"
+
+
+section 'the display'
+
+# The Wayland socket lives in the emptied runtime directory, so a GUI program
+# finds no display. -w binds that one socket back and nothing else: no sound,
+# no session bus, no GPU. Without it the display variables go the way of
+# SSH_AUTH_SOCK, so the program fails at once instead of on a path. A fake
+# compositor stands in, since the suite may run where there is no display.
+RT="$TMP/rt"
+mkdir -m 700 "$RT"
+: > "$RT/bus"
+python3 -c 'import socket, sys, time
+s = socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(8); time.sleep(120)' "$RT/wayland-9" &
+DISPLAYPID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$RT/wayland-9" ] && break; sleep 0.2; done
+wl_connect='import os, socket
+path = os.environ["WAYLAND_DISPLAY"]
+if not path.startswith("/"):
+    path = os.path.join(os.environ["XDG_RUNTIME_DIR"], path)
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(path); print("open")
+except OSError as e:
+    print(e.strerror)'
+# display NAME CODE [corral args...] - probe with a host display called NAME.
+display() { XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=$1 DISPLAY=:0 probe "$PROJECT" "${@:2}"; }
+
+is 'WAYLAND_DISPLAY is dropped' 'unset' "$(display wayland-9 'echo "${WAYLAND_DISPLAY:-unset}"')"
+is 'DISPLAY is dropped' 'unset' "$(display wayland-9 'echo "${DISPLAY:-unset}"')"
+is 'the runtime directory holds no socket' '' "$(display wayland-9 'ls -A "$XDG_RUNTIME_DIR"')"
+is '-e DISPLAY puts it back' ':0' "$(display wayland-9 'echo "${DISPLAY:-unset}"' -e DISPLAY)"
+is '-w binds the Wayland socket' 'open' "$(display wayland-9 "python3 -c '$wl_connect'" -w)"
+is 'and keeps WAYLAND_DISPLAY' 'wayland-9' "$(display wayland-9 'echo "${WAYLAND_DISPLAY:-unset}"' -w)"
+is 'and nothing else of the runtime directory comes along' 'wayland-9' \
+   "$(display wayland-9 'ls -A "$XDG_RUNTIME_DIR"' -w)"
+is 'DISPLAY stays dropped' 'unset' "$(display wayland-9 'echo "${DISPLAY:-unset}"' -w)"
+is 'an absolute WAYLAND_DISPLAY is bound as is' 'open' \
+   "$(display "$RT/wayland-9" "python3 -c '$wl_connect'" -w)"
+WAYLAND_DISPLAY= XDG_RUNTIME_DIR="$RT" corral_err "$PROJECT" -w --dry-run
+isnt '-w without a host display is refused' '0' "$PSTATUS"
+has  'the refusal names the variable' 'WAYLAND_DISPLAY' "$ERR_OUT"
+WAYLAND_DISPLAY=wayland-8 XDG_RUNTIME_DIR="$RT" corral_err "$PROJECT" -w --dry-run
+isnt '-w with a missing socket is refused' '0' "$PSTATUS"
+has  'the refusal names the socket' "$RT/wayland-8" "$ERR_OUT"
 
 
 section 'what is writable'

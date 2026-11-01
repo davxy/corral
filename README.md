@@ -22,6 +22,7 @@ corral -p -m .::ro        # the project read only too, for an untrusted checkout
 corral -e RUST_LOG=1      # set a variable inside for this run
 corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
+corral -w firefox         # give the host's Wayland display to a GUI program
 corral --dry-run          # print the bwrap command and exit
 corral claude             # run a tool directly instead of the shell
 corral list               # the sandbox homes, their size and last start
@@ -185,8 +186,8 @@ Hidden:
 - The sockets of Docker, containerd, podman, libvirt and pcscd, and the files
   under the `hide` key. corral covers them with `/dev/null`. Access to the
   Docker socket is root on the host.
-- `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS` and the `XDG_*_HOME` variables.
-  `PATH` entries under your real home.
+- `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `DISPLAY`
+  and the `XDG_*_HOME` variables. `PATH` entries under your real home.
 
 To give the host ssh agent to the sandbox:
 
@@ -256,6 +257,23 @@ overlayfs:
 - Only your own files can change. `corral -m /usr::tmp make install` fails.
 - The source must not contain a mount point, and two sources must not nest.
   corral refuses both.
+
+## GUI programs
+
+```
+corral -w firefox
+```
+
+`-w` binds the Wayland socket of the host into the sandbox and keeps
+`WAYLAND_DISPLAY`. Nothing else comes along: no sound, no session bus and no
+GPU, so the program renders in software. For sound, add
+`-m "$XDG_RUNTIME_DIR/pipewire-0"`. That socket also gives the microphone.
+
+A Wayland client cannot read the input or the windows of other clients, but
+niri and the wlroots compositors give every client screen capture and the
+clipboard without focus. A program with the socket has them too.
+
+corral drops `DISPLAY` and does not bind the X11 socket.
 
 ## Environment variables
 

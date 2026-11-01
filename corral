@@ -55,12 +55,14 @@ RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()
 # The tmpfs mounts that everything expects to write into.
 SCRATCH = (Path("/tmp"), Path("/var/tmp"), RUNTIME_DIR)
 
-# The first two name sockets that are deliberately out of reach. The rest
-# would send agent config and state back to the caller's own home, which is
-# the exact split the sandbox users exist to keep.
+# The first four name sockets that are deliberately out of reach; -w gives the
+# Wayland one back. The rest would send agent config and state back to the
+# caller's own home, which is the exact split the sandbox users exist to keep.
 DROPPED_ENV = (
     "SSH_AUTH_SOCK",
     "DBUS_SESSION_BUS_ADDRESS",
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
@@ -153,6 +155,17 @@ def parse_env(spec):
         # missing name has to be an error rather than a silent no-op.
         raise SystemExit(f"'{name}' is not set on the host, so there is nothing to forward")
     return name, os.environ[name]
+
+
+def wayland_display():
+    display = os.environ.get("WAYLAND_DISPLAY")
+    if not display:
+        raise SystemExit("--wayland: WAYLAND_DISPLAY is not set on the host, so there is no "
+                         "display to give")
+    socket_path = Path(display) if display.startswith("/") else RUNTIME_DIR / display
+    if not socket_path.is_socket():
+        raise SystemExit(f"--wayland: '{socket_path}' is not a socket")
+    return display, socket_path
 
 
 def guard_path(path, hidden, force, message, remedy=FORCE_REMEDY):
@@ -420,6 +433,10 @@ def build_command(config, project, args):
     variables = [parse_env(spec)
                  for spec in config_env(config, project, args) + project_env(project, args)
                  + args.env]
+    if args.wayland:
+        display, socket_path = wayland_display()
+        mounts.append((socket_path, socket_path, "ro"))
+        variables.append(("WAYLAND_DISPLAY", display))
 
     homes = Path(config["homes"]).expanduser()
     home = homes / username
@@ -1009,6 +1026,8 @@ def main():
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
                         help="set a variable, or forward the host's value")
     parser.add_argument("-n", "--net", choices=NETWORKS, help="network mode for this run")
+    parser.add_argument("-w", "--wayland", action="store_true",
+                        help="bind the host's Wayland socket, for a GUI program")
     parser.add_argument("--force", action="store_true",
                         help="allow the home directory or '/' as the project")
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")
