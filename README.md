@@ -2,21 +2,23 @@
 
 Limit the blast radius of agents, builds and scripts.
 
-A program can write only to the current directory, it sees the rest of the
-host read only, and your home is hidden. There is no daemon, no image and
-no container, and no root.
+A program sees the host read only, your home is hidden, and it can write
+only to a home of its own. With `-p`, the current directory is the project
+and is writable too. There is no daemon, no image and no container, and no
+root.
 
 Linux only.
 
 ## Usage
 
 ```
-corral                    # run as the default user from the config
+corral                    # a shell in the sandbox home, as the default user
+corral -p                 # the current directory is the project, writable
 corral -u throwaway       # run as another sandbox user
 corral -m ../core         # also mount a sibling, read only, same path inside
 corral -m /data:/data:rw  # mount a chosen path, writable
 corral -m ./sdk::tmp      # writable, but the writes vanish at exit
-corral -m .::ro           # the project read only too, for an untrusted checkout
+corral -p -m .::ro        # the project read only too, for an untrusted checkout
 corral -e RUST_LOG=1      # set a variable inside for this run
 corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
@@ -29,7 +31,8 @@ corral --help
 corral --version
 ```
 
-Only the project directory and the sandbox user's home keep changes after exit.
+Only the sandbox user's home, and the project with `-p`, keep changes after
+exit.
 
 ## Install
 
@@ -105,8 +108,8 @@ $ corral
 
 ## The project file
 
-A `.corral.toml` in the working directory holds the `-n`, `-u`, `-m` and `-e`
-values that a project always needs:
+With `-p`, a `.corral.toml` in the project directory holds the `-n`, `-u`,
+`-m` and `-e` values that the project always needs:
 
 ```toml
 network = "host"
@@ -124,7 +127,7 @@ expands nothing, `--force` does not apply to it, and corral does not look for
 it in parent directories. Every start prints what it added:
 
 ```
-$ corral
+$ corral -p
 .corral.toml: -n host -u myproject -m ../core -m /data/fixtures:/data:ro -e RUST_LOG=debug
 ```
 
@@ -152,14 +155,16 @@ called `list`, `remove` or `check`, put `--` before it.
 
 ## Filesystem
 
-The project directory has the same path inside as on the host, so absolute
-paths in build output, LSP indexes and agent sessions work on both sides.
-corral refuses `$HOME` and `/` as the project or as a mount source, unless you
-give `--force`.
+Without `-p`, no host directory is writable and the shell starts in the
+sandbox home. With `-p`, the current directory is the project: it is writable,
+the shell starts in it, and it has the same path inside as on the host, so
+absolute paths in build output, LSP indexes and agent sessions work on both
+sides. corral refuses `$HOME` and `/` as the project or as a mount source,
+unless you give `--force`.
 
 Writable:
 
-- the project directory, unless you give `-m .::ro`;
+- the project directory with `-p`, unless you give `-m .::ro`;
 - `/home/<user>`, which is `<homes>/<user>` on the host;
 - `/tmp`, `/var/tmp` and `$XDG_RUNTIME_DIR`, which are empty and go at exit.
 
@@ -173,9 +178,9 @@ Hidden:
   the path down to the project are left.
 - Each directory under the `hide` key, in the same way. With
   `hide = ["/mnt/ssd/develop"]`, a project there does not see the projects
-  next to it. corral refuses a mount or a start in a parent of a hidden
+  next to it. corral refuses a mount or a project in a parent of a hidden
   directory, because that shows it again. `--force` lifts this for `-m` and
-  the start directory.
+  `-p`.
 - `$XDG_RUNTIME_DIR`, which holds the sockets of the ssh and gpg agents.
 - The sockets of Docker, containerd, podman, libvirt and pcscd, and the files
   under the `hide` key. corral covers them with `/dev/null`. Access to the
@@ -198,7 +203,7 @@ other software comes from the host.
 corral -m ../core                  # read only, same path inside
 corral -m /data/sets:/data:rw      # writable, at a chosen path
 corral -m ~/notes:~/notes:rw       # into the sandbox home
-corral -m ./vendor::ro             # one directory of the project read only
+corral -p -m ./vendor::ro          # one directory of the project read only
 ```
 
 The syntax is `HOST[:GUEST[:MODE]]`, and `-m` is repeatable. GUEST is the host
@@ -241,7 +246,7 @@ you later run outside the sandbox.
 
 ```
 corral -m ./vendor/sdk::tmp ./configure
-corral -m .::tmp                   # the whole project as a throwaway copy
+corral -p -m .::tmp                # the whole project as a throwaway copy
 ```
 
 The host path becomes the lower layer of an overlay. The sandbox can write,
@@ -265,7 +270,7 @@ corral sets:
 |----------|-------|
 | `CORRAL` | `1` |
 | `CORRAL_USER` | the sandbox user name |
-| `CORRAL_PROJECT` | the start directory, so `cd "$CORRAL_PROJECT"` goes back to it |
+| `CORRAL_PROJECT` | the project directory, so `cd "$CORRAL_PROJECT"` goes back to it. Unset without `-p`. |
 | `SHELL` | the interactive shell |
 | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | `1`, for scrollback. `-e CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=` removes it. |
 
@@ -310,8 +315,8 @@ loopback, or to let the host reach the sandbox.
 ## Running a command
 
 ```
-corral claude
-corral claude --resume          # --resume goes to claude
+corral -p claude
+corral -p claude --resume       # --resume goes to claude
 corral -u throwaway opencode
 corral -- ./-weird-name
 ```
@@ -338,8 +343,8 @@ corral. The filter covers x86_64, aarch64 and riscv64. Elsewhere,
 corral limits the filesystem and the host loopback. It is not a security
 boundary against hostile code.
 
-- The start directory is fully writable. A start in `~/work` gives all of
-  `~/work`.
+- `-p` makes the whole start directory writable. A start in `~/work` with
+  `-p` gives all of `~/work`.
 - `private` and `host` have full outbound access, the LAN included.
 - `-n host` reaches a daemon on a TCP port of the host loopback, for example
   `dockerd -H tcp://127.0.0.1:2375`.

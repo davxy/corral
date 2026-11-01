@@ -66,24 +66,28 @@ isnt()   { [ "$2" != "$3" ] && ok "$1" || bad "$1" "expected anything but '$2'";
 has()    { case "$3" in *"$2"*) ok "$1";; *) bad "$1" "'$2' not in: $3";; esac; }
 hasnt()  { case "$3" in *"$2"*) bad "$1" "'$2' found in: $3";; *) ok "$1";; esac; }
 
-# probe DIR CODE [corral args...] - run CODE inside the sandbox, print what it
-# wrote. Markers fence off whatever the login shell's profile decides to say.
+# inside DIR CODE [corral args...] - start corral in DIR, run CODE in the
+# sandbox, print what it wrote. Markers fence off whatever the login shell's
+# profile decides to say.
 PSTATUS=0
-probe() {
+inside() {
     local dir=$1 code=$2 out
     shift 2
     out=$(cd "$dir" && "$CORRAL_BIN" "$@" sh -c "echo __B__; { $code ; } 2>&1; echo __E__" 2>&1)
     printf '%s' "$out" | sed -n '/^__B__$/,/^__E__$/{//!p;}'
 }
+# probe DIR CODE [corral args...] - the same, with DIR as the project.
+probe() { inside "$1" "$2" -p "${@:3}"; }
 
-# corral_err DIR [args...] - run a call whose exit status is the point, leaving
-# it in PSTATUS and its output in ERR_OUT. Not a command substitution, because
-# that would set PSTATUS in a subshell and leave the caller reading a stale one.
+# corral_err DIR [args...] - run a call with DIR as the project whose exit
+# status is the point, leaving it in PSTATUS and its output in ERR_OUT. Not a
+# command substitution, because that would set PSTATUS in a subshell and leave
+# the caller reading a stale one.
 ERR_OUT=
 corral_err() {
     local dir=$1
     shift
-    ERR_OUT=$(cd "$dir" && "$CORRAL_BIN" "$@" 2>&1)
+    ERR_OUT=$(cd "$dir" && "$CORRAL_BIN" -p "$@" 2>&1)
     PSTATUS=$?
 }
 
@@ -165,6 +169,24 @@ is 'the sandbox home is a real host write' 'kept' "$(cat "$TMP/homes/corral/stat
 probe "$PROJECT" 'echo elsewhere > "$HOME/state"' -u other >/dev/null
 is 'a second user writes to a second home' 'elsewhere' "$(cat "$TMP/homes/other/state" 2>&1)"
 is 'the first home is untouched by it' 'kept' "$(cat "$TMP/homes/corral/state" 2>&1)"
+# The write grant on the start directory is explicit. Without -p, corral
+# binds no host directory and starts the shell in the sandbox home, so a start
+# in the parent of every project, or in a checkout nobody read, hands the
+# sandbox nothing of the host.
+is 'without -p the shell starts in the sandbox home' '/home/corral' "$(inside "$PROJECT" 'pwd')"
+is 'and CORRAL_PROJECT is unset' 'unset' "$(inside "$PROJECT" 'echo "${CORRAL_PROJECT:-unset}"')"
+is 'and the sandbox home is the only writable bind' "--bind $TMP/homes/corral /home/corral" \
+   "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run 2>/dev/null | grep -o -- '--bind [^ ]* [^ ]*')"
+# A start directory where the sandbox shows the host, or the write would fail
+# for the wrong reason.
+mkdir -p "$VISIBLE/start"
+written=$(inside "$VISIBLE/start" "touch '$VISIBLE/start/marker'")
+case "$written" in
+*'Read-only file system'*) ok 'and the start directory is read only';;
+*'No such file'*) skip 'and the start directory is read only' \
+                       "the sandbox does not show $VISIBLE; set CORRAL_TEST_VISIBLE";;
+*) bad 'and the start directory is read only' "$written";;
+esac
 # Probed from the home-side project: binding a project that lives under /tmp
 # has to recreate its own path in the tmpfs, which would show up in this list.
 is '/tmp is empty' '' "$(probe "$HOMETMP" 'ls -A /tmp')"
@@ -580,6 +602,8 @@ isnt 'the home directory is refused as the project' '0' "$PSTATUS"
 has  'the refusal explains itself' 'home directory or the filesystem root' "$ERR_OUT"
 corral_err "$HOST_HOME" --force --dry-run
 is   '--force overrides the refusal' '0' "$PSTATUS"
+(cd "$HOST_HOME" && "$CORRAL_BIN" --dry-run >/dev/null 2>&1)
+is   'without -p the home directory is only where corral starts' '0' "$?"
 corral_err "$PROJECT" -m "$HOST_HOME" --dry-run
 isnt 'the home directory is refused as a mount source' '0' "$PSTATUS"
 corral_err "$PROJECT" -u 'Bad Name' --dry-run
@@ -697,9 +721,9 @@ fi
 section 'the project file'
 
 # A '.corral.toml' in the project directory stands for the flags that everyone
-# who clones the repository gets. It is read from the working directory only,
-# a flag beats it, and it cannot lift the guard on $HOME and '/'. The one line
-# it prints is what makes a mount from a file nobody read visible.
+# who clones the repository gets. It is read with -p, from the project directory
+# only, a flag beats it, and it cannot lift the guard on $HOME and '/'. The one
+# line it prints is what makes a mount from a file nobody read visible.
 FPROJECT="$TMP/filed"
 mkdir -p "$FPROJECT/sub" "$TMP/fixtures"
 echo fixture > "$TMP/fixtures/file"
@@ -717,7 +741,7 @@ corral_err "$FPROJECT" --dry-run
 has   'one line names the file and what it added' \
       '.corral.toml: -n host -u other -m ../sibling -e RUST_LOG=debug' "$ERR_OUT"
 hasnt 'that line is not on stdout' '.corral.toml' \
-      "$(cd "$FPROJECT" && "$CORRAL_BIN" --dry-run 2>/dev/null)"
+      "$(cd "$FPROJECT" && "$CORRAL_BIN" -p --dry-run 2>/dev/null)"
 
 is   'a network flag beats the file' 'lo' "$(probe "$FPROJECT" "python3 -c '$links'" -n none)"
 is   'a user flag beats the file' 'corral' "$(probe "$FPROJECT" 'echo "$CORRAL_USER"' -u corral)"
@@ -734,6 +758,8 @@ hasnt 'including the variable' 'RUST_LOG=debug' "$ERR_OUT"
 
 is 'a file in a parent directory is not read' 'unset' \
    "$(probe "$FPROJECT/sub" 'echo "${RUST_LOG:-unset}"')"
+is 'the file is not read without -p' 'unset' \
+   "$(inside "$FPROJECT" 'echo "${RUST_LOG:-unset}"')"
 
 project_file 'env = ["CORRAL_TEST_TOKEN"]'
 is 'a bare name in the file forwards the host value' 'from-host' \
@@ -767,7 +793,7 @@ isnt 'malformed TOML is refused' '0' "$PSTATUS"
 has  'that refusal names the file too' '.corral.toml' "$ERR_OUT"
 
 project_file
-is 'an empty file prints no line' '' "$(cd "$FPROJECT" && "$CORRAL_BIN" --dry-run 2>&1 >/dev/null)"
+is 'an empty file prints no line' '' "$(cd "$FPROJECT" && "$CORRAL_BIN" -p --dry-run 2>&1 >/dev/null)"
 
 
 section 'the config file'
@@ -1135,6 +1161,8 @@ else
     project_file
     XDG_CONFIG_HOME="$MCFG" corral_err "$ZONE" --dry-run
     isnt 'a project that holds a hidden directory is refused' '0' "$PSTATUS"
+    (cd "$ZONE" && XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" --dry-run >/dev/null 2>&1)
+    is   'a start there without -p is not' '0' "$?"
 
     # corral hid the literal '/home', so a real home anywhere else, such as
     # /var/home/<user> or /root, stayed readable.
