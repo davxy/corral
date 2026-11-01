@@ -25,8 +25,9 @@ corral -n host            # share the host's network for this run
 corral -w firefox         # give the host's Wayland display to a GUI program
 corral --dry-run          # print the bwrap command and exit
 corral claude             # run a tool directly instead of the shell
-corral list               # the sandbox homes, their size and last start
+corral list               # the sandbox homes, their size, last start and state
 corral remove NAME        # delete one, after a confirmation
+corral encrypt NAME       # put one under cryfs, see Encrypted homes
 corral check              # report what this host is missing
 corral --help
 corral --version
@@ -38,7 +39,8 @@ exit.
 ## Install
 
 corral needs `bubblewrap`, `passt` for the default network mode, and Python
-3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer.
+3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer, and encrypted
+homes need `cryfs`.
 
 ```
 sudo pacman -S bubblewrap passt          # Arch
@@ -65,6 +67,7 @@ kernel.unprivileged_userns_clone              ok    1
 user.max_user_namespaces                      ok    2147483647
 dev.tty.legacy_tiocsti                        ok    0, and the seccomp filter of corral refuses TIOCSTI
 pasta                                         ok    pasta 2026_07_28.f8df3f1
+cryfs                                         ok    CryFS Version 1.0.3
 ```
 
 `user namespace` is the result that matters. When it fails, the sysctl lines
@@ -86,6 +89,7 @@ The config is `~/.config/corral/config.toml`, or the same path under
 | `env` | variables for every sandbox, same syntax as `-e` |
 | `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
 | `shell` | interactive shell, default `$SHELL`, see [Running a command](#running-a-command) |
+| `key_command` | command that prints the passphrase of an encrypted home, see [Encrypted homes](#encrypted-homes) |
 
 A value can contain `$(command)`, `$NAME` and `${NAME}`, so the file can name
 a secret without the secret in it:
@@ -146,13 +150,58 @@ all run under your uid, so they are not a privilege boundary.
 
 ```
 $ corral list
-USER     SIZE  LAST USED         HOME
-corral   1.2G  2026-09-19 08:39  /home/you/.local/share/corral/homes/corral
-review     0B  never             /home/you/.local/share/corral/homes/review
+USER     SIZE  LAST USED         STATE     HOME
+agent    296M  2026-09-20 10:02  locked    /home/you/.local/share/corral/homes/agent
+corral   1.2G  2026-09-19 08:39  plain     /home/you/.local/share/corral/homes/corral
+review     0B  never             plain     /home/you/.local/share/corral/homes/review
 ```
 
 `corral remove NAME` deletes a home after a confirmation. To run a program
-called `list`, `remove` or `check`, put `--` before it.
+called `list`, `remove`, `encrypt` or `check`, put `--` before it.
+
+## Encrypted homes
+
+```
+corral encrypt agent
+```
+
+`encrypt NAME` puts the home of a sandbox user under [CryFS](https://www.cryfs.org).
+The files move into the cipher directory `<homes>/.NAME.cryfs`, and
+`<homes>/NAME` becomes its mount point. corral copies the home in, mounts the
+copy again and compares it with the original, and only then deletes the plain
+files. A home that never started is encrypted empty. It needs `cryfs`.
+
+Every start of the user mounts the cipher directory on the home, and the exit
+of the last sandbox of the user unmounts it. While a sandbox runs, the home is
+in clear on the host at `<homes>/NAME`. At rest, the cipher directory gives
+away the number of blocks, not the names, the sizes or the contents.
+
+The passphrase comes from the `key_command` of the config, run with `sh -c`
+and the sandbox user as `$1`, else from the terminal:
+
+```toml
+key_command = "pass show corral/$1"
+```
+
+Without a key command, `encrypt` asks twice. There is no recovery: a lost
+passphrase is a lost home.
+
+cryfs cannot hold sockets, pipes, devices and hard links. `encrypt` leaves the
+first three out and says how many, and a hard link becomes a file of its own.
+
+`corral list` shows `locked` or `unlocked` in the STATE column, and the size
+of the cipher directory. `corral remove NAME` unmounts and deletes the cipher
+directory too. Both `encrypt` and `remove` refuse while a sandbox of the user
+runs.
+
+Do not run `cryfs-unmount` on a home while a sandbox uses it. It is a lazy
+unmount: the mount point goes, the cryfs process lives on through the
+sandbox, and a second mount of the cipher directory would corrupt it. corral
+refuses to start the user until that process is gone. A killed corral leaves
+the home unlocked until the next sandbox of the user exits.
+
+`--dry-run` prints the cryfs command before the bwrap command and mounts
+nothing. A home that you mounted by hand is used as is.
 
 ## Filesystem
 
@@ -368,6 +417,7 @@ boundary against hostile code.
   `dockerd -H tcp://127.0.0.1:2375`.
 - Anything in a sandbox can use the credentials in its home. After
   `gh auth login`, an agent can push and read private repositories.
+- An encrypted home is in clear on the host while a sandbox of the user runs.
 - `none` still resolves names through the unix socket of the host resolver.
 - The hostname `corral` does not resolve when `nsswitch.conf` puts `resolve`
   before `files`. Some tools warn.
