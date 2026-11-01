@@ -847,11 +847,31 @@ time.sleep(4)' -n private >/dev/null &
     is 'private: a port bound inside is not bound on the host' 'closed' \
        "$(python3 -c "${reach//$port/$inner}")"
     wait "$INNERPID"
+
+    # A host with systemd-resolved names only its stub on 127.0.0.53. pasta
+    # drops a loopback nameserver when the host loopback is not mapped, and
+    # then warns at every start, about a list the sandbox never reads. The
+    # capabilities that mount needs are dropped again before corral, which
+    # must run as it does on the host.
+    printf 'nameserver 127.0.0.53\n' > "$TMP/stub-resolv.conf"
+    stub_resolver() {
+        unshare --user --map-current-user --mount --keep-caps sh -c \
+            'mount --bind "$0" /etc/resolv.conf && exec setpriv --inh-caps=-all --ambient-caps=-all "$@"' \
+            "$TMP/stub-resolv.conf" "$@"
+    }
+    if stub_resolver true 2>/dev/null; then
+        is 'private: a nameserver on the host loopback draws no warning' '' \
+           "$(cd "$PROJECT" && stub_resolver "$CORRAL_BIN" -n private true 2>&1 >/dev/null)"
+    else
+        skip 'private: a nameserver on the host loopback draws no warning' \
+             'unshare cannot replace /etc/resolv.conf here'
+    fi
 else
     skip 'private: the host loopback is unreachable' 'pasta cannot run here'
     skip 'private: an interface beyond loopback exists' 'pasta cannot run here'
     skip 'private: the gateway is not mapped to the host' 'pasta cannot run here'
     skip 'private: a port bound inside is not bound on the host' 'pasta cannot run here'
+    skip 'private: a nameserver on the host loopback draws no warning' 'pasta cannot run here'
 fi
 
 

@@ -802,11 +802,14 @@ def build_command(config, project, args, username):
         # pasta forwards ports both ways unless told not to: a port bound on
         # the host answers inside, and a port bound inside is bound on the
         # host. --no-map-gw closes the third way in, the host behind the
-        # gateway address.
+        # gateway address. The sandbox reads the resolv.conf of the host and
+        # never asks pasta for a nameserver. Without --dns none, pasta warns
+        # at every start when the only nameserver is on the host loopback, as
+        # with systemd-resolved, because --no-map-gw makes it drop that one.
         command = ["pasta", "--config-net", "--quiet",
                    "--tcp-ports", "none", "--udp-ports", "none",
                    "--tcp-ns", "none", "--udp-ns", "none",
-                   "--no-map-gw", "--"] + command
+                   "--no-map-gw", "--dns", "none", "--"] + command
 
     return command
 
