@@ -14,6 +14,10 @@ default_user = "corral"
 # "private", "host" or "none".
 network = "private"
 
+# Command that prints the passphrase of an encrypted home, run with the sandbox
+# user as its argument, '$1'. Without the key, corral asks on the terminal.
+key_command = "pass show corral/$1"
+
 # The interactive shell, also in the generated passwd and in SHELL. Without the
 # key, $SHELL of the host, or /bin/bash when the sandbox cannot run $SHELL. A
 # command after the options runs in 'bash -lc' with any shell.

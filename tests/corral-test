@@ -4,7 +4,8 @@
 #
 # Needs bwrap on PATH. The 'private' network assertions need pasta as well and
 # report 'skip' without it, which is what happens inside a sandbox that has no
-# /dev/net/tun. Everything is written under three temporary directories: one
+# /dev/net/tun. The encrypted home assertions need cryfs and /dev/fuse in the
+# same way. Everything is written under three temporary directories: one
 # in $TMPDIR, one under $HOME, because 'a project below /home still works' is
 # itself one of the properties, and one next to corral, for the hidden
 # directories. All three are removed on exit, and so is the one socket the
@@ -27,12 +28,14 @@ SOCK=
 SOCKPID=
 DAEMONPID=
 DISPLAYPID=
+LOCKED=
 
 cleanup() {
     [ -n "$SOCKPID" ] && kill "$SOCKPID" 2>/dev/null
     [ -n "$DAEMONPID" ] && kill "$DAEMONPID" 2>/dev/null
     [ -n "$DISPLAYPID" ] && kill "$DISPLAYPID" 2>/dev/null
     [ -n "$SOCK" ] && rm -f "$SOCK"
+    [ -n "$LOCKED" ] && fusermount -u "$LOCKED" 2>/dev/null
     rm -rf "$TMP" "$HOMETMP" "$VISIBLE"
 }
 trap cleanup EXIT
@@ -976,7 +979,7 @@ toml_keys() {
     python3 -c 'import sys, tomllib
 print(" ".join(sorted(tomllib.load(open(sys.argv[1], "rb")))))' "$1" 2>&1
 }
-is 'the example config names every key' 'default_user env hide homes mounts network shell' \
+is 'the example config names every key' 'default_user env hide homes key_command mounts network shell' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 # The script holds the version. setup.py reads it from there with the pattern
@@ -1469,6 +1472,130 @@ mkdir -p "$TMP/nobwrap"
 ln -s "$(command -v python3)" "$TMP/nobwrap/python3"
 is 'list works without bwrap on PATH' 'corral unused' \
    "$(LIST_OUT=$(cd "$PROJECT" && PATH="$TMP/nobwrap" "$CORRAL_BIN" list 2>&1); rows)"
+
+
+section 'encrypted homes'
+
+# A home with a cipher directory '.USER.cryfs' next to it in the homes root is
+# encrypted. corral mounts the cipher directory on the home with cryfs before
+# the sandbox starts and unmounts it after the exit, so that the files rest
+# encrypted. The passphrase comes from the config's key command, with the user
+# as its argument, else from the terminal. The suite makes the cipher
+# directory itself, with a fixed passphrase, and keeps the cryfs state out of
+# the real one.
+if command -v cryfs >/dev/null && command -v fusermount >/dev/null && [ -c /dev/fuse ]; then
+    export CRYFS_LOCAL_STATE_DIR="$TMP/cryfs-state"
+    LOCKED="$TMP/homes/locked"
+    CIPHER="$TMP/homes/.locked.cryfs"
+    mkdir -p "$CIPHER" "$LOCKED" "$TMP/keys"
+    echo secret > "$TMP/keys/locked"
+    printf 'secret\n' | CRYFS_FRONTEND=noninteractive CRYFS_NO_UPDATE_CHECK=true \
+        cryfs "$CIPHER" "$LOCKED" >/dev/null 2>&1
+    echo plain > "$LOCKED/plain"
+    fusermount -u "$LOCKED"
+    # state - whether the home is mounted, which is what 'unlocked' means.
+    state() { grep -q " $LOCKED " /proc/self/mountinfo && echo unlocked || echo locked; }
+    # enc_config NAME [LINE] - a config on the suite's homes root, with LINE.
+    enc_config() {
+        mkdir -p "$TMP/$1/corral"
+        printf 'homes = "%s"\nnetwork = "none"\n%s\n' "$TMP/homes" "${2:-}" > "$TMP/$1/corral/config.toml"
+    }
+    enc_config enc-config "key_command = \"cat $TMP/keys/\$1\""
+    enc_config wrong-config 'key_command = "echo wrong"'
+    enc_config failing-config 'key_command = "exit 3"'
+    enc_config nokey-config
+    ENCCFG="$TMP/enc-config"
+    # enc CODE [corral args...] - run CODE as the encrypted user.
+    enc() { XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" "$1" -u locked "${@:2}"; }
+
+    is 'the suite starts with the home locked' 'locked' "$(state)"
+    is 'the files of an encrypted home are visible inside' 'plain' "$(enc 'cat ~/plain')"
+    is 'and the home is locked again after the exit' 'locked' "$(state)"
+    is 'and the mount point is empty' '' "$(ls -A "$LOCKED")"
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" -u locked true 2>&1)
+    is 'a good start says nothing about cryfs' '' "$out"
+    blocks=$(find "$CIPHER" -type f | wc -l)
+    enc 'echo written > ~/new' >/dev/null
+    is 'a write inside lands in the cipher directory' 'more' \
+       "$([ "$(find "$CIPHER" -type f | wc -l)" -gt "$blocks" ] && echo more || echo same)"
+    is 'and not in clear' '' "$(grep -rl written "$CIPHER")"
+    is 'and is there at the next start' 'written' "$(enc 'cat ~/new')"
+
+    # Two sandboxes of the user share the mount, and the last exit locks it.
+    # The first sits in the project, with nothing of the home open: the mount
+    # has to stay because corral holds it, not because the shell does.
+    if sleeping 31701; then
+        bad 'a second sandbox of the user sees the same home' 'a stale sandbox of an earlier run is on the host'
+    else
+        (cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" exec "$CORRAL_BIN" -p -u locked sleep 31701) \
+            >/dev/null 2>&1 &
+        BGPID=$!
+        if await_sleep 31701; then
+            is 'a second sandbox of the user sees the same home' 'plain' "$(enc 'cat ~/plain')"
+            is 'and its exit leaves the home unlocked for the first' 'unlocked' "$(state)"
+            kill "$(pgrep -f '^sleep 31701$')"
+            reap "$BGPID"
+            is 'the exit of the last sandbox locks the home' 'locked' "$(state)"
+        else
+            bad 'a second sandbox of the user sees the same home' 'the sandbox never started'
+            reap "$BGPID"
+        fi
+    fi
+
+    # A home unlocked by hand is used as is, and locked at the exit all the
+    # same. The wrong key proves that corral did not run cryfs.
+    printf 'secret\n' | CRYFS_FRONTEND=noninteractive CRYFS_NO_UPDATE_CHECK=true \
+        cryfs "$CIPHER" "$LOCKED" >/dev/null 2>&1
+    is 'a home unlocked by hand is used as is' 'plain' \
+       "$(XDG_CONFIG_HOME="$TMP/wrong-config" inside "$PROJECT" 'cat ~/plain' -u locked)"
+    is 'and locked at the exit all the same' 'locked' "$(state)"
+
+    XDG_CONFIG_HOME="$TMP/wrong-config" corral_err "$PROJECT" -u locked true
+    isnt 'a wrong passphrase stops the start' '0' "$PSTATUS"
+    has  'and the refusal carries the cryfs message' 'correct password' "$ERR_OUT"
+    is   'and the home stays locked' 'locked' "$(state)"
+    XDG_CONFIG_HOME="$TMP/failing-config" corral_err "$PROJECT" -u locked true
+    isnt 'a failing key command stops the start' '0' "$PSTATUS"
+    has  'and the message names the key and the status' "'key_command'" "$ERR_OUT"
+    has  'and the status' 'status 3' "$ERR_OUT"
+
+    # Without a key command corral asks on the terminal. setsid takes the
+    # terminal away, so the question falls back to stdin.
+    printf 'secret\n' | (cd "$PROJECT" && XDG_CONFIG_HOME="$TMP/nokey-config" \
+        setsid -w "$CORRAL_BIN" -u locked sh -c 'echo asked > ~/asked') >/dev/null 2>"$TMP/ask-err"
+    is  'without a key command corral asks for the passphrase' 'asked' "$(enc 'cat ~/asked')"
+    has 'and the question names the user' "Passphrase for 'locked'" "$(cat "$TMP/ask-err")"
+    (cd "$PROJECT" && XDG_CONFIG_HOME="$TMP/nokey-config" setsid -w "$CORRAL_BIN" -u locked true) \
+        </dev/null >/dev/null 2>"$TMP/ask-err"; status=$?
+    isnt 'no answer stops the start' '0' "$status"
+    has  'with Aborted' 'Aborted' "$(cat "$TMP/ask-err")"
+
+    # cryfs exits 0 when fuse refuses a mount point that is not empty, so
+    # corral has to look at the mount itself.
+    touch "$LOCKED/stray"
+    XDG_CONFIG_HOME="$ENCCFG" corral_err "$PROJECT" -u locked true
+    isnt 'a mount point that is not empty stops the start' '0' "$PSTATUS"
+    has  'and the refusal says so' 'not empty' "$ERR_OUT"
+    rm "$LOCKED/stray"
+
+    mkdir -p "$TMP/nocryfs"
+    for tool in python3 bwrap sh cat; do ln -s "$(command -v "$tool")" "$TMP/nocryfs/$tool"; done
+    PATH="$TMP/nocryfs" XDG_CONFIG_HOME="$ENCCFG" corral_err "$PROJECT" -u locked true
+    isnt  'an encrypted home without cryfs on PATH stops the start' '0' "$PSTATUS"
+    has   'and the message names cryfs' 'cryfs' "$ERR_OUT"
+    hasnt 'without a traceback' 'Traceback' "$ERR_OUT"
+    is    'and the home stays locked' 'locked' "$(state)"
+
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$ENCCFG" "$CORRAL_BIN" -u locked --dry-run 2>/dev/null)
+    is  '--dry-run prints the cryfs command first' \
+        "env CRYFS_FRONTEND=noninteractive CRYFS_NO_UPDATE_CHECK=true cryfs $CIPHER $LOCKED" \
+        "$(printf '%s\n' "$out" | sed -n 1p)"
+    has 'and the bwrap command after it' 'bwrap' "$(printf '%s\n' "$out" | sed -n 2p)"
+    is  '--dry-run mounts nothing' 'locked' "$(state)"
+    is  'and puts nothing into the mount point' '' "$(ls -A "$LOCKED")"
+else
+    skip 'encrypted homes' 'cryfs, fusermount or /dev/fuse is missing'
+fi
 
 
 section 'check'

@@ -3,6 +3,7 @@
 import argparse
 import ctypes
 import errno
+import getpass
 import os
 import platform
 import re
@@ -39,6 +40,10 @@ HOSTNAME = "corral"
 # so the internet works but the host's own loopback services do not answer.
 NETWORKS = ("private", "host", "none")
 DEFAULT_NETWORK = "private"
+
+# cryfs takes the passphrase on stdin and asks nothing else, and it does not
+# call home to look for a newer version.
+CRYFS_ENV = ("CRYFS_FRONTEND=noninteractive", "CRYFS_NO_UPDATE_CHECK=true")
 
 # The username ends up in a generated passwd entry and as a directory name.
 USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
@@ -227,6 +232,71 @@ def generated_dir(homes, username):
     return homes / ".corral" / username
 
 
+def cipher_dir(homes, username):
+    """Where the blocks of an encrypted home rest, next to its mount point."""
+    return homes / f".{username}.cryfs"
+
+
+def mounted(path):
+    return any(Path(line.split()[4]) == path
+               for line in Path("/proc/self/mountinfo").read_text().splitlines())
+
+
+def cryfs_command(homes, username):
+    return ["env", *CRYFS_ENV, "cryfs", str(cipher_dir(homes, username)), str(homes / username)]
+
+
+def read_passphrase(config, username):
+    """From the key command, with the user as its argument, else from the terminal."""
+    if "key_command" not in config:
+        return getpass.getpass(f"Passphrase for '{username}': ")
+    command = config["key_command"]
+    if not isinstance(command, str):
+        raise SystemExit(f"'key_command' in '{CONFIG_PATH}' must be a string")
+    # stdin and stderr stay on the terminal, so that 'pass' can ask for its
+    # own passphrase.
+    run = subprocess.run(["sh", "-c", command, "sh", username], stdout=subprocess.PIPE, text=True)
+    if run.returncode != 0:
+        raise SystemExit(f"'key_command' in '{CONFIG_PATH}' failed with status {run.returncode}")
+    return run.stdout.rstrip("\n")
+
+
+def unlock_home(homes, username, config):
+    """Mount the cipher directory on the home, unless it is mounted already."""
+    home = homes / username
+    if mounted(home):
+        return
+    if not shutil.which("cryfs"):
+        raise SystemExit(f"the home of '{username}' is encrypted and needs 'cryfs'; is the cryfs "
+                         f"package installed?")
+    run = subprocess.run(cryfs_command(homes, username), capture_output=True, text=True,
+                         input=read_passphrase(config, username) + "\n")
+    # cryfs exits 0 when fuse refuses a mount point that is not empty.
+    if run.returncode != 0 or not mounted(home):
+        said = (run.stderr.strip() or run.stdout.strip().rpartition("\n")[2]
+                or f"cryfs exited with {run.returncode}")
+        raise SystemExit(f"cannot unlock '{home}': {said}")
+
+
+def prepare_home(homes, username, config, dry_run):
+    """The home, created, unlocked when it is encrypted, and seeded.
+
+    A dry run mounts nothing, and the seed would then land on the bare mount
+    point, which cryfs refuses as not empty from there on.
+    """
+    home = homes / username
+    if not home.is_dir():
+        home.mkdir(parents=True)
+        print(f"Created '{home}'.", file=sys.stderr)
+    if cipher_dir(homes, username).is_dir():
+        if dry_run:
+            print(shlex.join(cryfs_command(homes, username)))
+            return home
+        unlock_home(homes, username, config)
+    seed_home(home)
+    return home
+
+
 def generated_etc(directory, username, guest_home, shell):
     """The /etc files that have to describe the sandbox rather than the host.
 
@@ -405,10 +475,14 @@ def bind_args(source, target, mode):
     return ["--bind" if mode == "rw" else "--ro-bind", str(source), str(target)]
 
 
-def build_command(config, project, args):
+def choose_user(config, project, args):
     username = args.user or project.get("user") or config.get("default_user") or DEFAULT_USER
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
+    return username
+
+
+def build_command(config, project, args, username):
     hidden_files, hidden_directories = hidden_paths(config)
     shell = choose_shell(config, hidden_directories)
     guest_home = Path("/home").resolve() / username
@@ -442,11 +516,6 @@ def build_command(config, project, args):
 
     homes = Path(config["homes"]).expanduser()
     home = homes / username
-    if not home.is_dir():
-        home.mkdir(parents=True)
-        print(f"Created '{home}'.", file=sys.stderr)
-    seed_home(home)
-
     generated = generated_dir(homes, username)
     generated.mkdir(parents=True, exist_ok=True)
 
@@ -636,6 +705,23 @@ def run_sandbox(command):
         signal.signal(signum, lambda *_: None)
     status = subprocess.run(command, preexec_fn=die_with_parent).returncode
     return 128 - status if status < 0 else status
+
+
+def run_and_lock(command, home):
+    """Run the sandbox, then lock the home unless another sandbox of the user
+    still uses it.
+
+    The kernel counts the users of each mount on its own, and a sandbox uses
+    the home through a bind of its own, so the unmount on the host would go
+    through under a running sandbox. Each corral holds the host mount open
+    instead, and fusermount refuses with 'busy' while any does.
+    """
+    held = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        return run_sandbox(command)
+    finally:
+        os.close(held)
+        subprocess.run(["fusermount", "-u", str(home)], capture_output=True)
 
 
 def disk_usage(root):
@@ -1083,7 +1169,11 @@ def main():
 
     project = read_project() if args.project else {}
     config = load_config()
-    command = build_command(expand_config(config), project, args)
+    settings = expand_config(config)
+    username = choose_user(settings, project, args)
+    command = build_command(settings, project, args, username)
+    homes = Path(settings["homes"]).expanduser()
+    home = prepare_home(homes, username, settings, args.dry_run)
     flags = config_flags(config, project, args)
     if flags:
         print(f"{CONFIG_PATH}: {shlex.join(flags)}", file=sys.stderr)
@@ -1093,6 +1183,8 @@ def main():
     if args.dry_run:
         print(shlex.join(command))
         return
+    if cipher_dir(homes, username).is_dir():
+        raise SystemExit(run_and_lock(command, home))
     raise SystemExit(run_sandbox(command))
 
 
