@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
 import errno
 import os
 import platform
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -14,7 +16,7 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 CWD = Path.cwd().resolve()
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
@@ -616,6 +618,26 @@ def build_command(config, project, args):
     return command
 
 
+def die_with_parent():
+    PR_SET_PDEATHSIG = 1
+    ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
+
+
+def run_sandbox(command):
+    """Run the sandbox and wait for it, so that work after the exit has a process.
+
+    Ctrl-C reaches the whole foreground group, corral included. The command
+    handles it; corral only waits. A Python handler rather than SIG_IGN,
+    because an ignored signal survives exec and the command would start deaf
+    to Ctrl-C. The child takes SIGKILL when corral dies: bwrap does that for
+    its own child, pasta does not.
+    """
+    for signum in (signal.SIGINT, signal.SIGQUIT):
+        signal.signal(signum, lambda *_: None)
+    status = subprocess.run(command, preexec_fn=die_with_parent).returncode
+    return 128 - status if status < 0 else status
+
+
 def disk_usage(root):
     """Blocks rather than sizes, so the number agrees with du."""
     total = root.lstat().st_blocks * 512
@@ -1071,7 +1093,7 @@ def main():
     if args.dry_run:
         print(shlex.join(command))
         return
-    os.execvp(command[0], command)
+    raise SystemExit(run_sandbox(command))
 
 
 if __name__ == "__main__":

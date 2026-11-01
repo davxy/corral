@@ -672,6 +672,93 @@ is  'the command exit status propagates' '42' "$?"
 out=$(cd "$PROJECT" && "$CORRAL_BIN" true 2>&1 >/dev/null)
 is  'a good run says nothing on stderr' '' "$out"
 
+# corral stays the parent of the sandbox and waits for it, so that the work
+# after an exit, such as locking an encrypted home, has a process to run in.
+# A parent has to pass the status on, must not die from the Ctrl-C that the
+# terminal sends to the whole foreground group, must not hand the command an
+# ignored SIGINT, and has to take the sandbox down when it is killed, pasta
+# included. Each background sandbox sleeps for its own number of seconds, so
+# that pgrep finds exactly its sleep on the host.
+# sleeping SECONDS - true while a 'sleep SECONDS' runs on the host.
+sleeping() { pgrep -f "^sleep $1\$" >/dev/null; }
+# await_sleep SECONDS - wait for that sleep to start, or fail.
+await_sleep() { for _ in $(seq 50); do sleeping "$1" && return 0; sleep 0.1; done; return 1; }
+# await_gone SECONDS - wait for that sleep to end, or give up.
+await_gone() { for _ in $(seq 50); do sleeping "$1" || return 0; sleep 0.1; done; return 1; }
+# in_group PROGRAM [args...] - become PROGRAM in a process group of its own,
+# with SIGINT and SIGQUIT at their defaults, as a terminal starts its
+# foreground job. A background job of a shell without job control has both
+# ignored, and the ignore would pass through exec down to the command. An
+# exec, so that the background pid is corral itself and reap can kill it.
+in_group() {
+    exec python3 -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGQUIT, signal.SIG_DFL)
+os.setsid()
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+}
+# reap PID - leave the exit status of the background corral PID in REAPED, or
+# 'hung' when it is still there after five seconds, killed then so that the
+# suite goes on. Not a command substitution: only this shell can wait for it.
+REAPED=
+reap() {
+    for _ in $(seq 50); do kill -0 "$1" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$1" 2>/dev/null; then
+        kill -KILL "$1"; wait "$1" 2>/dev/null; REAPED=hung
+    else
+        wait "$1"; REAPED=$?
+    fi
+}
+
+(cd "$PROJECT" && "$CORRAL_BIN" sh -c 'kill -TERM $$' >/dev/null 2>&1)
+is  'a signal death inside gives 128 plus the signal' '143' "$?"
+is  'the command starts with SIGINT at its default' 'True' \
+    "$(probe "$PROJECT" "python3 -c 'import signal; print(signal.getsignal(signal.SIGINT) is signal.default_int_handler)'")"
+(cd "$PROJECT" && exec "$CORRAL_BIN" -p sleep 31415) >/dev/null 2>&1 &
+BGPID=$!
+await_sleep 31415
+kill -TERM "$(pgrep -P "$BGPID")" 2>/dev/null
+reap "$BGPID"
+is  'a signal that kills the sandbox process gives 128 plus the signal' '143' "$REAPED"
+await_gone 31415
+
+seq=0
+for mode in $modes; do
+    seq=$((seq + 1))
+    # A sleep already there belongs to a sandbox that an earlier run left
+    # behind, and the signals below would go to it instead.
+    if sleeping $((31500 + seq)) || sleeping $((31600 + seq)); then
+        bad "$mode: SIGINT to the group ends the command with 130" 'a stale sandbox of an earlier run is on the host'
+        bad "$mode: a killed corral takes the sandbox down" 'a stale sandbox of an earlier run is on the host'
+        continue
+    fi
+    (cd "$PROJECT" && in_group "$CORRAL_BIN" -p -n "$mode" sleep $((31500 + seq))) \
+        >/dev/null 2>"$TMP/int-err" &
+    BGPID=$!
+    if await_sleep $((31500 + seq)); then
+        kill -INT -- "-$(ps -o pgid= -p "$(pgrep -f "^sleep $((31500 + seq))\$")" | tr -d ' ')"
+        reap "$BGPID"
+        is    "$mode: SIGINT to the group ends the command with 130" '130' "$REAPED"
+        hasnt "$mode: and corral says nothing about it" 'Aborted' "$(cat "$TMP/int-err")"
+        hasnt "$mode: and shows no traceback" 'Traceback' "$(cat "$TMP/int-err")"
+        await_gone $((31500 + seq))
+    else
+        bad "$mode: SIGINT to the group ends the command with 130" 'the sandbox never started'
+    fi
+
+    (cd "$PROJECT" && exec "$CORRAL_BIN" -p -n "$mode" sleep $((31600 + seq))) >/dev/null 2>&1 &
+    BGPID=$!
+    if await_sleep $((31600 + seq)); then
+        kill -KILL "$BGPID"
+        wait "$BGPID" 2>/dev/null
+        await_gone $((31600 + seq))
+        is "$mode: a killed corral takes the sandbox down" 'gone' \
+           "$(sleeping $((31600 + seq)) && echo still there || echo gone)"
+    else
+        bad "$mode: a killed corral takes the sandbox down" 'the sandbox never started'
+    fi
+done
+
 # The command is a positional, so corral stops at the first word that is not an
 # option. Everything after that word has to reach the command untouched, even a
 # flag corral owns itself, and a typo in a corral option has to fail rather than
@@ -892,11 +979,15 @@ print(" ".join(sorted(tomllib.load(open(sys.argv[1], "rb")))))' "$1" 2>&1
 is 'the example config names every key' 'default_user env hide homes mounts network shell' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
-# The version is in three files, and a release has to change all of them.
+# The script holds the version. setup.py reads it from there with the pattern
+# below, so a version line in pyproject.toml would be a second copy. The
+# PKGBUILD cannot read it, since its source URL needs pkgver, so a release
+# changes the script and the PKGBUILD.
 version=$("$CORRAL_BIN" --version 2>&1)
-is 'corral --version prints the version' 'corral 0.1.0' "$version"
-is 'pyproject.toml has the same version' "${version#corral }" \
-   "$(sed -n 's/^version = "\(.*\)"$/\1/p' "$(dirname "$CORRAL_BIN")/pyproject.toml")"
+is 'corral --version prints the version of the script' \
+   "corral $(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$CORRAL_BIN")" "$version"
+is 'pyproject.toml holds no version of its own' '' \
+   "$(grep '^version = ' "$(dirname "$CORRAL_BIN")/pyproject.toml")"
 is 'the PKGBUILD has the same version' "${version#corral }" \
    "$(sed -n 's/^pkgver=//p' "$(dirname "$CORRAL_BIN")/PKGBUILD")"
 

@@ -1,6 +1,6 @@
 # Maintainer: Davide Galassi <davxy@datawok.net>
 pkgname=corral
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Limit the blast radius of agents, builds and scripts"
 arch=('any')
