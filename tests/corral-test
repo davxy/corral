@@ -875,6 +875,132 @@ else
 fi
 
 
+section 'the VPN'
+
+# --vpn sends the traffic of the sandbox through a WireGuard tunnel, whatever
+# the host does. The tunnel has to be the only way out: a tunnel that is down
+# must send nothing, rather than send in clear. A fake host stands in for the
+# host and the internet, because a test cannot reach a real VPN: a network
+# namespace with an uplink, an address beyond it, a WireGuard peer, and a
+# server on port 8000 that answers with the address of its client.
+VPN="$VISIBLE/vpn"
+mkdir -p "$VPN"
+printf '[Interface]\nPrivateKey = unused\n[Peer]\nPublicKey = unused\n' > "$VPN/no-address.conf"
+corral_err "$PROJECT" -n host --vpn "$VPN/no-address.conf" true
+isnt 'vpn: another network mode is refused' '0' "$PSTATUS"
+has  'the refusal names the mode it needs' "'private'" "$ERR_OUT"
+corral_err "$PROJECT" -n private --vpn "$VPN/no-address.conf" true
+isnt 'vpn: a config without an address is refused' '0' "$PSTATUS"
+has  'the refusal names the key' 'Address' "$ERR_OUT"
+# corral reads the file again inside the namespace of pasta, where a pipe
+# that it has already read gives nothing.
+corral_err "$PROJECT" -n private --vpn <(cat "$VPN/no-address.conf") true
+isnt 'vpn: a config that is not a regular file is refused' '0' "$PSTATUS"
+has  'the refusal says why' 'regular file' "$ERR_OUT"
+
+cat > "$VPN/host.sh" <<'EOF'
+set -e
+dir=$(dirname "$0")
+ip link set lo up
+ip link add uplink type dummy
+ip address add 192.0.2.1/24 dev uplink
+ip link set uplink up
+ip route add default via 192.0.2.254
+ip link add far type dummy
+ip address add 198.51.100.1/32 dev far
+ip link set far up
+ip link add peer type wireguard
+wg set peer private-key "$dir/peer.key" listen-port 51820 \
+    peer "$(cat "$dir/client.pub")" allowed-ips 10.99.0.2/32
+ip address add 10.99.0.1/24 dev peer
+ip link set peer up
+python3 -c 'import socket
+server = socket.create_server(("0.0.0.0", 8000))
+while True:
+    client, (address, _) = server.accept()
+    client.sendall(address.encode() + b"\n")
+    client.close()' &
+trap 'kill $!' EXIT
+sleep 0.5
+setpriv --inh-caps=-all --ambient-caps=-all "$@"
+EOF
+
+# fake_probe CODE [corral args...] - run CODE in the project, in a 'private'
+# sandbox on the fake host. The fake host needs every capability to build its
+# network, and drops them before corral, which must run as it does on the host.
+fake_probe() {
+    (cd "$PROJECT" && unshare --user --map-current-user --net --keep-caps \
+        bash "$VPN/host.sh" "$CORRAL_BIN" -p -n private "${@:2}" \
+        sh -c "echo __B__; { $1 ; } 2>&1; echo __E__" 2>&1) | sed -n '/^__B__$/,/^__E__$/{//!p;}'
+}
+
+whoami='import socket, sys
+s = socket.socket(); s.settimeout(3)
+try:
+    s.connect((sys.argv[1], 8000)); print(s.recv(64).decode().strip())
+except OSError:
+    print("closed")'
+
+# The keys are made by wg, so a host without it skips like a host whose kernel
+# cannot make the interfaces of the fake host.
+if (umask 077; for name in peer client stranger; do
+        wg genkey > "$VPN/$name.key" && wg pubkey < "$VPN/$name.key" > "$VPN/$name.pub" || exit 1
+    done) 2>/dev/null &&
+   pasta --config-net --no-map-gw --quiet -- /bin/true >/dev/null 2>&1 &&
+   unshare --user --map-current-user --net --keep-caps bash "$VPN/host.sh" true 2>/dev/null; then
+    # A wg-quick config as a provider gives it. PostUp is a command that
+    # wg-quick runs as root on the host, and corral must run none of them.
+    client_conf() {
+        printf '%s\n' '[Interface]' "PrivateKey = $(cat "$VPN/client.key")" \
+            'Address = 10.99.0.2/32' 'DNS = 10.99.0.1, corral.test' 'MTU = 1380' \
+            "PostUp = touch $VPN/post-up-ran" '' '[Peer]' "PublicKey = $(cat "$VPN/$1.pub")" \
+            'Endpoint = 198.51.100.1:51820' 'AllowedIPs = 0.0.0.0/0'
+    }
+    (umask 077; client_conf peer > "$VPN/client.conf"; client_conf stranger > "$VPN/stranger.conf")
+
+    # The control: without --vpn, the fake host routes the address itself,
+    # so an answer from the tunnel address below can only come from the
+    # tunnel, and a refusal only from the VPN.
+    is 'fake host: without --vpn, the internet address answers from outside the tunnel' \
+       '198.51.100.1' "$(fake_probe "python3 -c '$whoami' 198.51.100.1")"
+    is 'vpn: the sandbox has only the loopback and the tunnel' 'lo wg0' \
+       "$(fake_probe "python3 -c '$links'" --vpn "$VPN/client.conf")"
+    is 'vpn: the peer answers through the tunnel' '10.99.0.2' \
+       "$(fake_probe "python3 -c '$whoami' 10.99.0.1" --vpn "$VPN/client.conf")"
+    is 'vpn: an internet address sees the address in the tunnel' '10.99.0.2' \
+       "$(fake_probe "python3 -c '$whoami' 198.51.100.1" --vpn "$VPN/client.conf")"
+    is 'vpn: with no handshake, nothing goes out' 'closed' \
+       "$(fake_probe "python3 -c '$whoami' 198.51.100.1" --vpn "$VPN/stranger.conf")"
+    # The host resolver would answer from the host network, outside the
+    # tunnel. Only the DNS of the config resolves, through the tunnel.
+    is 'vpn: resolv.conf names the DNS of the config' 'nameserver 10.99.0.1 search corral.test' \
+       "$(fake_probe 'echo $(cat /etc/resolv.conf)' --vpn "$VPN/client.conf")"
+    is 'vpn: the MTU of the config applies' '1380' \
+       "$(fake_probe "ip -o link show wg0 | sed 's/.* mtu \([0-9]*\).*/\1/'" --vpn "$VPN/client.conf")"
+    sockets=
+    for path in /run/systemd/resolve/io.systemd.Resolve /run/dbus/system_bus_socket \
+                /run/nscd/socket /run/avahi-daemon/socket; do
+        [ -S "$path" ] && sockets="$sockets $path"
+    done
+    if [ -n "$sockets" ]; then
+        is 'vpn: no resolver socket of the host is left' 'none' \
+           "$(fake_probe "for path in$sockets; do [ -S \"\$path\" ] && echo \"\$path\"; done; echo none" \
+              --vpn "$VPN/client.conf")"
+    else
+        skip 'vpn: no resolver socket of the host is left' 'this host has none of them'
+    fi
+    is 'vpn: the config, with its private key, is unreadable inside' 'unreadable' \
+       "$(fake_probe "cat $VPN/client.conf >/dev/null 2>&1 && echo readable || echo unreadable" \
+          --vpn "$VPN/client.conf")"
+    is 'vpn: the sandbox holds no capabilities' '0000000000000000' \
+       "$(fake_probe "awk '/^CapEff:/ { print \$2 }' /proc/self/status" --vpn "$VPN/client.conf")"
+    is 'vpn: PostUp never ran' 'absent' "$([ -e "$VPN/post-up-ran" ] && echo ran || echo absent)"
+else
+    skip 'vpn: every assertion on the fake host' \
+         'wg, pasta, or the dummy and WireGuard interfaces in a user namespace are missing'
+fi
+
+
 section 'the project file'
 
 # A '.corral.toml' in the project directory stands for the flags that everyone
@@ -1852,6 +1978,11 @@ if command -v cryfs >/dev/null; then
     has 'as ok' 'ok' "$(line cryfs)"
 else
     has 'a missing cryfs is a warning that names the package' 'cryfs package' "$(line cryfs)"
+fi
+if command -v wg >/dev/null; then
+    has 'check reports wg with its version' 'wireguard-tools' "$(line wg)"
+else
+    has 'a missing wg is a warning that names the package' 'wireguard-tools package' "$(line wg)"
 fi
 hasnt 'nothing fails here' 'FAIL' "$CHECK_OUT"
 hasnt 'pasta is never a failure' 'FAIL' "$(line pasta)"

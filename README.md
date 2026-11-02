@@ -22,6 +22,7 @@ corral -p -m .::ro        # the project read only too, for an untrusted checkout
 corral -e RUST_LOG=1      # set a variable inside for this run
 corral -e GITHUB_TOKEN    # forward the host's value for this run
 corral -n host            # share the host's network for this run
+corral --vpn ~/wg.conf    # send all traffic through a WireGuard tunnel
 corral -w firefox         # give the host's Wayland display to a GUI program
 corral --dry-run          # print the bwrap command and exit
 corral claude             # run a tool directly instead of the shell
@@ -39,8 +40,8 @@ exit.
 ## Install
 
 corral needs `bubblewrap`, `passt` for the default network mode, and Python
-3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer, and encrypted
-homes need `cryfs`.
+3.11 or newer. `:tmp` mounts need `bubblewrap` 0.11.0 or newer, encrypted
+homes need `cryfs`, and `--vpn` needs `wireguard-tools`.
 
 ```
 sudo pacman -S bubblewrap passt          # Arch
@@ -67,6 +68,7 @@ kernel.unprivileged_userns_clone              ok    1
 user.max_user_namespaces                      ok    2147483647
 dev.tty.legacy_tiocsti                        ok    0, and the seccomp filter of corral refuses TIOCSTI
 pasta                                         ok    pasta 2026_07_28.f8df3f1
+wg                                            ok    wireguard-tools v1.0.20260223 - https://git.zx2c4.com/wireguard-tools/
 cryfs                                         ok    CryFS Version 1.0.3
 ```
 
@@ -379,6 +381,31 @@ loopback, or to let the host reach the sandbox.
 
 `-n` overrides the config and the project file.
 
+## VPN
+
+`--vpn FILE` sends all the traffic of the sandbox through a WireGuard
+tunnel, independently from the host and without root. FILE is a wg-quick
+config, as a VPN provider gives it. `--vpn` needs the `private` mode.
+
+corral makes the WireGuard interface in the network namespace of `pasta`,
+so the encrypted packets leave through `pasta`. Then it moves the interface
+into a new namespace, where the sandbox starts. There the tunnel and the
+loopback are the only interfaces, so a tunnel that is down sends nothing.
+The sandbox has no capability to change this.
+
+From `[Interface]`, corral applies `Address`, `DNS` and `MTU`. It ignores
+`Table`, `SaveConfig`, and the commands `PreUp`, `PostUp`, `PreDown` and
+`PostDown`, and it runs none of them. The rest goes to `wg setconf`.
+
+The resolv.conf of the sandbox names only the `DNS` servers of FILE, so
+without `DNS` no name resolves. corral hides the sockets of the host
+resolvers: systemd-resolved, the system D-Bus, nscd and avahi. A lookup
+through them would leave by the host network. corral also hides FILE, which
+holds the private key.
+
+FILE must be a regular file, not a pipe such as `<(pass show wg)`, because
+corral reads it again inside the namespace of `pasta`.
+
 ## Running a command
 
 ```
@@ -419,6 +446,9 @@ boundary against hostile code.
   `gh auth login`, an agent can push and read private repositories.
 - An encrypted home is in clear on the host while a sandbox of the user runs.
 - `none` still resolves names through the unix socket of the host resolver.
+- Under `--vpn`, a host daemon that the sandbox reaches through a unix
+  socket can still send traffic by the host network. corral hides only the
+  name resolvers. Add others under `hide`.
 - The hostname `corral` does not resolve when `nsswitch.conf` puts `resolve`
   before `files`. Some tools warn.
 

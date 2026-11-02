@@ -7,7 +7,8 @@ arch=('any')
 url="https://github.com/davxy/corral"
 license=('MIT')
 depends=('python' 'bubblewrap')
-optdepends=('passt: the private network mode')
+optdepends=('passt: the private network mode'
+            'wireguard-tools: the --vpn option')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # Run 'updpkgsums' once the tag exists.
 sha256sums=('SKIP')

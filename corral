@@ -5,6 +5,7 @@ import ctypes
 import errno
 import filecmp
 import getpass
+import ipaddress
 import os
 import platform
 import re
@@ -41,6 +42,24 @@ HOSTNAME = "corral"
 # so the internet works but the host's own loopback services do not answer.
 NETWORKS = ("private", "host", "none")
 DEFAULT_NETWORK = "private"
+
+# Sockets through which anyone can have a name resolved from the host network:
+# systemd-resolved directly and over the system bus, nscd and avahi. Under
+# --vpn, such a lookup would leave outside the tunnel.
+RESOLVERS = (
+    "/run/systemd/resolve/io.systemd.Resolve",
+    "/run/dbus/system_bus_socket",
+    "/run/nscd/socket",
+    "/run/avahi-daemon/socket",
+)
+
+# The keys of a wg-quick config that 'wg setconf' refuses. corral applies the
+# first three itself, and runs none of the commands.
+WG_QUICK_KEYS = ("address", "dns", "mtu", "table", "preup", "postup", "predown", "postdown",
+                 "saveconfig")
+
+# The first argument with which corral runs itself inside pasta; see vpn_helper.
+VPN_HELPER = "--vpn-helper"
 
 # cryfs takes the passphrase on stdin and asks nothing else, and it does not
 # call home to look for a newer version.
@@ -174,6 +193,53 @@ def wayland_display():
     if not socket_path.is_socket():
         raise SystemExit(f"--wayland: '{socket_path}' is not a socket")
     return display, socket_path
+
+
+def is_address(text):
+    try:
+        ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return True
+
+
+def read_vpn(path):
+    """The wg-quick config at PATH, split as wg-quick splits it.
+
+    Returns the text for 'wg setconf', the addresses, the MTU or None, and a
+    resolv.conf. A DNS entry that is an address is a nameserver there, and
+    any other is a search domain.
+    """
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as error:
+        raise SystemExit(f"cannot read the VPN config '{path}': {error.strerror}")
+    config, addresses, dns, mtu = [], [], [], None
+    interface = False
+    for line in lines:
+        key, _, value = line.partition("#")[0].partition("=")
+        key = key.strip().lower()
+        if key.startswith("["):
+            interface = key == "[interface]"
+        if not (interface and key in WG_QUICK_KEYS):
+            config.append(line)
+        elif key == "address":
+            addresses += value.replace(",", " ").split()
+        elif key == "dns":
+            dns += value.replace(",", " ").split()
+        elif key == "mtu":
+            mtu = value.strip()
+    if not addresses:
+        raise SystemExit(f"no Address in the [Interface] of the VPN config '{path}'")
+    try:
+        addresses = [ipaddress.ip_interface(address) for address in addresses]
+    except ValueError as error:
+        raise SystemExit(f"invalid Address in the VPN config '{path}': {error}")
+    resolv = "".join(f"nameserver {entry}\n" for entry in dns if is_address(entry))
+    domains = [entry for entry in dns if not is_address(entry)]
+    if domains:
+        resolv += f"search {' '.join(domains)}\n"
+    return "\n".join(config) + "\n", addresses, mtu, resolv
 
 
 def guard_path(path, hidden, force, message, remedy=FORCE_REMEDY):
@@ -491,15 +557,15 @@ def scaffold(target, tmpfs_roots):
     return args
 
 
-def hidden_paths(config):
-    """The files and the directories to hide.
+def hidden_paths(config, extra):
+    """The files and the directories to hide, EXTRA included.
 
     Links are resolved, because bwrap refuses to mount on one, and /home is
     one on Fedora Atomic. The real home is hidden also when it is not under
     /home, such as /root.
     """
     files, directories = [], []
-    for spec in HIDDEN + ("/home", "~") + tuple(config_hide(config)):
+    for spec in HIDDEN + ("/home", "~") + tuple(config_hide(config)) + extra:
         path = Path(spec).expanduser().resolve()
         # bwrap cannot mount on a path in a directory that the caller cannot
         # read, such as /run/containerd. A path that the caller cannot open
@@ -607,16 +673,28 @@ def choose_user(config, project, args):
 
 
 def build_command(config, project, args, username):
-    hidden_files, hidden_directories = hidden_paths(config)
-    shell = choose_shell(config, hidden_directories)
-    guest_home = Path("/home").resolve() / username
-
     network = args.net or project.get("network") or config.get("network") or DEFAULT_NETWORK
     if network not in NETWORKS:
         raise SystemExit(f"invalid network '{network}': expected one of {', '.join(NETWORKS)}")
+    vpn = None
+    if args.vpn:
+        if network != "private":
+            raise SystemExit(f"--vpn needs the network mode 'private', not '{network}'")
+        vpn = Path(args.vpn).expanduser().absolute()
+        if vpn.exists() and not vpn.is_file():
+            raise SystemExit(f"--vpn: '{vpn}' is not a regular file, and corral reads it again "
+                             f"inside the network namespace")
+        _, _, _, resolv = read_vpn(vpn)
     if network == "private" and not shutil.which("pasta"):
         raise SystemExit("network 'private' needs 'pasta', from the 'passt' package.\n"
                          "Install it, or pass '-n host' to share the host's network.")
+    if vpn and not shutil.which("wg"):
+        raise SystemExit("--vpn needs 'wg', from the wireguard-tools package.")
+
+    # The VPN config holds the private key of the tunnel.
+    hidden_files, hidden_directories = hidden_paths(config, RESOLVERS + (str(vpn),) if vpn else ())
+    shell = choose_shell(config, hidden_directories)
+    guest_home = Path("/home").resolve() / username
 
     project_dir = CWD if args.project else None
     if project_dir:
@@ -709,6 +787,12 @@ def build_command(config, project, args, username):
     # and the sandbox would answer getpwuid() with the caller's host entry.
     for guest, path in generated_etc(generated, username, guest_home, shell).items():
         command += ["--ro-bind", str(path), guest]
+    if vpn:
+        # On the link target, because bwrap cannot mount on a link, and
+        # /etc/resolv.conf is one under systemd-resolved.
+        resolv_path = generated / "resolv.conf"
+        resolv_path.write_text(resolv)
+        command += ["--ro-bind", str(resolv_path), str(Path("/etc/resolv.conf").resolve())]
 
     seccomp = tty_filter(platform.machine())
     if seccomp:
@@ -798,6 +882,9 @@ def build_command(config, project, args, username):
         # after it, just before bwrap.
         command = ["sh", "-c", 'exec "$@" 3<"$0"', str(seccomp_path)] + command
 
+    if vpn:
+        command = [sys.executable, str(Path(__file__).resolve()), VPN_HELPER, str(vpn)] + command
+
     if network == "private":
         # pasta forwards ports both ways unless told not to: a port bound on
         # the host answers inside, and a port bound inside is bound on the
@@ -812,6 +899,43 @@ def build_command(config, project, args, username):
                    "--no-map-gw", "--dns", "none", "--"] + command
 
     return command
+
+
+def run_step(command, **options):
+    """One step of the tunnel setup. The tool itself says what went wrong."""
+    if subprocess.run(command, **options).returncode != 0:
+        raise SystemExit(f"--vpn: '{shlex.join(command)}' failed")
+
+
+def vpn_helper(path, command):
+    """Set up the tunnel of the VPN config at PATH, then exec COMMAND.
+
+    corral runs itself again for this inside pasta, as root of the user
+    namespace of pasta. wg0 is made in the network namespace of pasta, where
+    its UDP socket stays, and is then moved into a new namespace that has
+    nothing else. The sandbox starts there, without the capabilities to change
+    it. The config is read again here, because pasta closes every inherited
+    file descriptor, and the private key must not go on a command line, into
+    the environment or into a file.
+    """
+    config, addresses, mtu, _ = read_vpn(path)
+    run_step(["ip", "link", "add", "wg0", "type", "wireguard"])
+    run_step(["wg", "setconf", "wg0", "/dev/stdin"], input=config, text=True)
+    outer = os.open("/proc/self/ns/net", os.O_RDONLY)
+    CLONE_NEWNET = 0x40000000
+    if ctypes.CDLL(None, use_errno=True).unshare(CLONE_NEWNET) != 0:
+        raise SystemExit(f"--vpn: cannot make a network namespace: "
+                         f"{os.strerror(ctypes.get_errno())}")
+    run_step(["nsenter", f"--net=/proc/self/fd/{outer}",
+              "ip", "link", "set", "wg0", "netns", str(os.getpid())], pass_fds=[outer])
+    os.close(outer)
+    run_step(["ip", "link", "set", "lo", "up"])
+    for address in addresses:
+        run_step(["ip", "address", "add", str(address), "dev", "wg0"])
+    run_step(["ip", "link", "set", "wg0", "up"] + (["mtu", mtu] if mtu else []))
+    for version in sorted({address.version for address in addresses}):
+        run_step(["ip", f"-{version}", "route", "add", "default", "dev", "wg0"])
+    os.execvp(command[0], command)
 
 
 def die_with_parent():
@@ -1080,6 +1204,10 @@ def check_host(rest):
         else:
             rows.append(("pasta", WARN, f"{version}, cannot run: {error}; 'private' will "
                                         f"fail, so use -n host or -n none"))
+    if not shutil.which("wg"):
+        rows.append(("wg", WARN, "not on PATH; --vpn needs it, from the wireguard-tools package"))
+    else:
+        rows.append(("wg", OK, tool_version("wg")))
     if not shutil.which("cryfs"):
         rows.append(("cryfs", WARN, "not on PATH; an encrypted home needs it, from the cryfs "
                                     "package"))
@@ -1298,6 +1426,9 @@ def expand_config(config):
 
 
 def main():
+    if sys.argv[1:2] == [VPN_HELPER]:
+        vpn_helper(Path(sys.argv[2]), sys.argv[3:])
+
     parser = argparse.ArgumentParser(
         prog="corral",
         # Spelled out because argparse renders a trailing REMAINDER as a bare
@@ -1327,6 +1458,9 @@ def main():
     parser.add_argument("-e", "--env", action="append", default=[], metavar="NAME[=VALUE]",
                         help="set a variable, or forward the host's value")
     parser.add_argument("-n", "--net", choices=NETWORKS, help="network mode for this run")
+    parser.add_argument("--vpn", metavar="FILE",
+                        help="send all traffic through the WireGuard tunnel of this wg-quick "
+                             "config; needs the 'private' network mode")
     parser.add_argument("-w", "--wayland", action="store_true",
                         help="bind the host's Wayland socket, for a GUI program")
     parser.add_argument("--force", action="store_true",
