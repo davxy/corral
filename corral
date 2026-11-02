@@ -44,11 +44,11 @@ NETWORKS = ("private", "host", "none")
 DEFAULT_NETWORK = "private"
 
 # Sockets through which anyone can have a name resolved from the host network:
-# systemd-resolved directly and over the system bus, nscd and avahi. Under
-# --vpn, such a lookup would leave outside the tunnel.
+# systemd-resolved directly, nscd and avahi. The system bus, the other way to
+# systemd-resolved, is in HIDDEN. Under --vpn, such a lookup would leave
+# outside the tunnel.
 RESOLVERS = (
     "/run/systemd/resolve/io.systemd.Resolve",
-    "/run/dbus/system_bus_socket",
     "/run/nscd/socket",
     "/run/avahi-daemon/socket",
 )
@@ -99,12 +99,16 @@ DROPPED_ENV = (
 # Daemons that act as root for anyone who can connect. The user namespace
 # keeps the groups of the caller, so a member of 'docker' would get root on the
 # host. A read-only bind does not stop connect(), so /dev/null goes on top.
+# The system bus is here because polkit takes a process in the sandbox for the
+# active session of the caller, and logind then powers off, reboots or
+# suspends the host for it.
 HIDDEN = (
     "/run/docker.sock",
     "/run/containerd/containerd.sock",
     "/run/podman/podman.sock",
     "/run/libvirt/libvirt-sock",
     "/run/pcscd/pcscd.comm",
+    "/run/dbus/system_bus_socket",
 )
 
 # The sandbox shares the terminal of the caller. TIOCSTI types into its input,

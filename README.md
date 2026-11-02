@@ -237,6 +237,10 @@ Hidden:
 - The sockets of Docker, containerd, podman, libvirt and pcscd, and the files
   under the `hide` key. corral covers them with `/dev/null`. Access to the
   Docker socket is root on the host.
+- The system D-Bus. polkit takes a process in the sandbox for your active
+  session, so logind would power off, reboot or suspend the host for it, and
+  UDisks2 would mount a disk. `systemctl`, `timedatectl` and `udisksctl` do
+  not work inside.
 - `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, `WAYLAND_DISPLAY`, `DISPLAY`
   and the `XDG_*_HOME` variables. `PATH` entries under your real home.
 
@@ -399,9 +403,9 @@ From `[Interface]`, corral applies `Address`, `DNS` and `MTU`. It ignores
 
 The resolv.conf of the sandbox names only the `DNS` servers of FILE, so
 without `DNS` no name resolves. corral hides the sockets of the host
-resolvers: systemd-resolved, the system D-Bus, nscd and avahi. A lookup
-through them would leave by the host network. corral also hides FILE, which
-holds the private key.
+resolvers: systemd-resolved, nscd and avahi. A lookup through them would
+leave by the host network. corral also hides FILE, which holds the private
+key.
 
 FILE must be a regular file, not a pipe such as `<(pass show wg)`, because
 corral reads it again inside the namespace of `pasta`.

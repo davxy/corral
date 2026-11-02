@@ -1373,6 +1373,31 @@ else
     skip 'the Docker socket of the host is hidden by default' 'no /run/docker.sock'
 fi
 
+# The system bus gives no root, and it does not need to. polkit sees the
+# cgroup of a process in the sandbox, which is the session scope of the
+# caller, and takes it for the active local session: logind powers off,
+# reboots or suspends the host for it, and UDisks2 mounts a disk. The bus
+# listens on a path, so the /dev/null covers every network mode. As with
+# Docker, a mount of the socket does not give it back.
+SYSBUS=/run/dbus/system_bus_socket
+if [ -S "$SYSBUS" ]; then
+    is 'the system bus of the host refuses a connection' 'refused' \
+       "$(connects "$PROJECT" "$SYSBUS")"
+    is 'also under the host network' 'refused' "$(connects "$PROJECT" "$SYSBUS" -n host)"
+    if pasta --config-net --no-map-gw --quiet -- /bin/true >/dev/null 2>&1; then
+        is 'also under the private network' 'refused' \
+           "$(connects "$PROJECT" "$SYSBUS" -n private)"
+    else
+        skip 'also under the private network' 'pasta cannot run here'
+    fi
+    is 'and a mount of the socket does not give it back' 'refused' \
+       "$(connects "$PROJECT" "$SYSBUS" -m "$SYSBUS")"
+    has 'the dry run covers it with /dev/null' "--ro-bind /dev/null $SYSBUS" \
+        "$(cd "$PROJECT" && "$CORRAL_BIN" --dry-run)"
+else
+    skip 'the system bus assertions' 'no /run/dbus/system_bus_socket'
+fi
+
 
 section 'hidden directories'
 
