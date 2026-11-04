@@ -1022,7 +1022,7 @@ def sandbox_homes(homes):
 def list_homes(rest):
     argparse.ArgumentParser(prog="corral list",
                             description="List the sandbox homes.").parse_args(rest)
-    homes = Path(expand_config(load_config())["homes"]).expanduser()
+    homes = Path(load_settings()["homes"]).expanduser()
     names = sandbox_homes(homes)
     if not names:
         print(f"No sandbox homes under '{homes}'.")
@@ -1047,7 +1047,7 @@ def remove_home(rest):
     username = parser.parse_args(rest).user
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
-    homes = Path(expand_config(load_config())["homes"]).expanduser()
+    homes = Path(load_settings()["homes"]).expanduser()
     home = homes / username
     cipher = cipher_dir(homes, username)
     if home.is_symlink():
@@ -1077,7 +1077,7 @@ def encrypt_home(rest):
     username = parser.parse_args(rest).user
     if not USERNAME_RE.match(username):
         raise SystemExit(f"invalid user '{username}': expected {USERNAME_RE.pattern}")
-    config = expand_config(load_config())
+    config = load_settings("key_command")
     homes = Path(config["homes"]).expanduser()
     home = homes / username
     cipher = cipher_dir(homes, username)
@@ -1427,6 +1427,16 @@ def expand_config(config):
             expanded[key] = value
     Path(expanded["homes"]).expanduser().mkdir(parents=True, exist_ok=True)
     return expanded
+
+
+def load_settings(*keys):
+    """The expanded config, with only KEYS and 'homes' in it.
+
+    A command in another value can ask for a passphrase, as 'pass' does, and
+    only a start has a use for its output.
+    """
+    config = load_config()
+    return expand_config({key: config[key] for key in ("homes", *keys) if key in config})
 
 
 def main():

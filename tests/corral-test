@@ -1255,6 +1255,28 @@ mount_config 'env = ["X=$(echo"]'
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'an unterminated command is refused' '0' "$PSTATUS"
 
+# A command in the config can ask for a passphrase, as 'pass' does, so only a
+# start may run all of them. Help, the version and the verbs run the commands
+# of the keys they use and no other. The leftover mount point stops 'encrypt'
+# before it asks for a passphrase of its own.
+printf 'homes = "$CORRAL_TEST_HOMES"\nnetwork = "none"\nenv = ["X=$(touch %s)"]\n' \
+       "$TMP/verb-ran" > "$MCFG_FILE"
+mkdir "$TMP/homes/.nobody.mount"
+# config_ran ARGS... - whether a corral call with ARGS ran the env command.
+config_ran() {
+    rm -f "$TMP/verb-ran"
+    (cd "$PROJECT" && CORRAL_TEST_HOMES="$TMP/homes" XDG_CONFIG_HOME="$MCFG" \
+         "$CORRAL_BIN" "$@" >/dev/null 2>&1 </dev/null)
+    [ -e "$TMP/verb-ran" ] && echo ran || echo absent
+}
+is 'a start runs the command of every key' 'ran' "$(config_ran --dry-run)"
+for call in -h --version list check 'remove nobody' 'encrypt nobody'; do
+    is "'$call' runs no command of another key" 'absent' "$(config_ran $call)"
+done
+rmdir "$TMP/homes/.nobody.mount"
+has 'list still expands the homes root' "$TMP/homes/" \
+    "$(cd "$PROJECT" && CORRAL_TEST_HOMES="$TMP/homes" XDG_CONFIG_HOME="$MCFG" "$CORRAL_BIN" list)"
+
 project_file "env = [\"FROM_FILE=\$(touch $TMP/project-file-ran)\"]"
 is   'a command in a project file stays text' "\$(touch $TMP/project-file-ran)" \
      "$(probe "$FPROJECT" 'echo "$FROM_FILE"')"
@@ -1851,6 +1873,13 @@ PY
     is 'encrypt works for a user that never started' '0' "$status"
     is 'and the first start has a writable home' 'hi' \
        "$(XDG_CONFIG_HOME="$ENCCFG" inside "$PROJECT" 'echo hi > ~/hi && cat ~/hi' -u newborn)"
+
+    # encrypt runs only the commands of the keys it uses, and the key command
+    # is one of them: it expands as at a start. An unset variable shows it,
+    # because sh makes it empty and corral refuses it.
+    enc_config absent-key-config 'key_command = "echo $CORRAL_TEST_ABSENT"'
+    out=$(cd "$PROJECT" && XDG_CONFIG_HOME="$TMP/absent-key-config" "$CORRAL_BIN" encrypt keyless 2>&1)
+    has 'encrypt expands the key command' "'CORRAL_TEST_ABSENT' for 'key_command'" "$out"
 
     # Without a key command the passphrase is asked twice, and it is the one
     # the home opens with afterwards.
