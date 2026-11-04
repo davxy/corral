@@ -980,12 +980,12 @@ def run_and_lock(command, home):
 
 
 def disk_usage(root):
-    """Blocks rather than sizes, so the number agrees with du."""
-    total = root.lstat().st_blocks * 512
-    for directory, subdirectories, files in os.walk(root):
-        for name in subdirectories + files:
-            total += (Path(directory) / name).lstat().st_blocks * 512
-    return total
+    """du counts a hard link once, and a walk in Python takes seconds on a
+    home with a toolchain in it. For a directory that it cannot read, du
+    exits 1 and still gives the total of the rest."""
+    run = subprocess.run(["du", "-s", "-B1", str(root)], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True)
+    return int(run.stdout.split()[0])
 
 
 def format_size(size):

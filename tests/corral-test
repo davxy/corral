@@ -1603,6 +1603,18 @@ has 'a row ends with the path of the home' "$TMP/homes/unused" "$(row unused)"
 head -c 1048576 /dev/zero > "$TMP/homes/unused/blob"
 LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1)
 is 'the size counts what is inside' '1.0M' "$(row unused | awk '{ print $2 }')"
+ln "$TMP/homes/unused/blob" "$TMP/homes/unused/blob-link"
+LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1)
+is 'a hard link costs nothing more' '1.0M' "$(row unused | awk '{ print $2 }')"
+# A program in the sandbox can make a directory that corral cannot read. The
+# home is still there and still costs what the rest of it costs.
+mkdir "$TMP/homes/unused/shut"
+chmod 000 "$TMP/homes/unused/shut"
+LIST_OUT=$(cd "$PROJECT" && "$CORRAL_BIN" list 2>&1); status=$?
+chmod 700 "$TMP/homes/unused/shut"
+is    'a directory that cannot be read does not stop list' '0' "$status"
+is    'and the home still shows its size' '1.0M' "$(row unused | awk '{ print $2 }')"
+hasnt 'and list says nothing of it' 'shut' "$LIST_OUT"
 
 EMPTYCFG="$TMP/empty-config"
 mkdir -p "$EMPTYCFG/corral" "$TMP/empty-homes"
@@ -1663,6 +1675,7 @@ isnt 'list is refused inside a sandbox' '0' "$status"
 has  'and the refusal says so' 'already inside' "$out"
 mkdir -p "$TMP/nobwrap"
 ln -s "$(command -v python3)" "$TMP/nobwrap/python3"
+ln -s "$(command -v du)" "$TMP/nobwrap/du"
 is 'list works without bwrap on PATH' 'corral unused' \
    "$(LIST_OUT=$(cd "$PROJECT" && PATH="$TMP/nobwrap" "$CORRAL_BIN" list 2>&1); rows)"
 
