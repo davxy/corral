@@ -1123,9 +1123,12 @@ is 'and corral does not write to it' 'network = "none"' "$(cat "$CFRESH/corral/c
 # key is added.
 toml_keys() {
     python3 -c 'import sys, tomllib
-print(" ".join(sorted(tomllib.load(open(sys.argv[1], "rb")))))' "$1" 2>&1
+config = tomllib.load(open(sys.argv[1], "rb"))
+keys = set(config).union(*config.get("users", {}).values())
+print(" ".join(sorted(keys)))' "$1" 2>&1
 }
-is 'the example config names every key' 'default_user env hide homes key_command mounts network shell' \
+is 'the example config names every key' \
+   'default_user env hide homes key_command mounts network shell users vpn' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 # The script holds the version. setup.py reads it from there with the pattern
@@ -1307,6 +1310,195 @@ isnt 'a missing source in the config stops the run' '0' "$PSTATUS"
 mount_config "mounts = \"$TMP/sibling\""
 XDG_CONFIG_HOME="$MCFG" corral_err "$PROJECT" --dry-run
 isnt 'mounts that are not a list are refused' '0' "$PSTATUS"
+
+
+section 'per-user config'
+
+# Each sandbox user keeps a different work apart, so each needs its own
+# mounts, variables or network: a download user needs a VPN, a review user
+# needs nothing. A section [users.NAME] of the config, and a file
+# users/NAME.toml next to it, apply only when NAME is the user. The order is
+# config, section, file, project file, flags. A later network, shell or vpn
+# replaces an earlier one. Mounts, variables and hidden paths add up, and a
+# later variable of the same name wins. The same key can now come from three
+# places, so each source gets its own line on stderr, and each error names
+# its source.
+UCFG="$TMP/user-config"
+UCFG_FILE="$UCFG/corral/config.toml"
+USER_FILE="$UCFG/corral/users/other.toml"
+mkdir -p "$UCFG/corral/users" "$TMP/per-user/section" "$TMP/per-user/file" "$TMP/per-user/project"
+echo section > "$TMP/per-user/section/file"
+echo file > "$TMP/per-user/file/file"
+# user_config LINES... - the config: the base keys, then LINES. A line
+# '[users.other]' starts the section of 'other'.
+user_config() {
+    printf 'homes = "%s"\ndefault_user = "corral"\nnetwork = "none"\n' "$TMP/homes" > "$UCFG_FILE"
+    printf '%s\n' "$@" >> "$UCFG_FILE"
+}
+# user_file LINES... - the file of 'other'. Without LINES, there is no file.
+user_file() {
+    rm -f "$USER_FILE"
+    [ $# -eq 0 ] || printf '%s\n' "$@" > "$USER_FILE"
+}
+uprobe() { XDG_CONFIG_HOME="$UCFG" probe "$PROJECT" "$@"; }
+uerr()   { XDG_CONFIG_HOME="$UCFG" corral_err "$PROJECT" "$@"; }
+
+both_mounts='echo $(cat '"$TMP"'/per-user/section/file '"$TMP"'/per-user/file/file 2>/dev/null)'
+user_config '[users.other]' "mounts = [\"$TMP/per-user/section\"]"
+user_file "mounts = [\"$TMP/per-user/file\"]"
+is 'the section and the file of a user add their mounts' 'section file' \
+   "$(uprobe "$both_mounts" -u other)"
+is 'neither applies to another user' '' "$(uprobe "$both_mounts")"
+
+user_config 'env = ["ORDER=config", "GLOBAL=g"]' '[users.other]' 'env = ["ORDER=section", "SECTION=s"]'
+user_file 'env = ["ORDER=file"]'
+is 'variables add up, and the file beats the section' 'file s g' \
+   "$(uprobe 'echo $ORDER $SECTION $GLOBAL' -u other)"
+is 'another user gets the config alone' 'config g' "$(uprobe 'echo $ORDER $GLOBAL $SECTION')"
+is 'a variable flag beats the file' 'flag' "$(uprobe 'echo $ORDER' -u other -e ORDER=flag)"
+printf 'env = ["ORDER=project"]\n' > "$TMP/per-user/project/.corral.toml"
+is 'so does the project file' 'project' \
+   "$(XDG_CONFIG_HOME="$UCFG" probe "$TMP/per-user/project" 'echo $ORDER' -u other)"
+user_file
+is 'the section beats the config' 'section' "$(uprobe 'echo $ORDER' -u other)"
+
+user_config 'env = ["GLOBAL=g"]' \
+            '[users.other]' "mounts = [\"$TMP/per-user/section\"]" 'env = ["ORDER=section"]'
+user_file 'env = ["ORDER=file"]'
+uerr -u other --dry-run
+is 'each source gets one line, without what a later source replaced' \
+   "$UCFG_FILE: -e GLOBAL=g
+$UCFG_FILE [users.other]: -m $TMP/per-user/section
+$USER_FILE: -e ORDER=file" "$(printf '%s\n' "$ERR_OUT" | grep -F "$UCFG/corral/")"
+
+user_config '[users.other]' 'network = "host"' 'shell = "/bin/sh"'
+user_file
+uerr -u other --dry-run
+hasnt 'the network of the section replaces the config' '--unshare-net' "$ERR_OUT"
+uerr --dry-run
+has   'only for its user' '--unshare-net' "$ERR_OUT"
+uerr -u other -n none --dry-run
+has   'a network flag replaces the section' '--unshare-net' "$ERR_OUT"
+user_file 'network = "none"'
+uerr -u other --dry-run
+has   'the network of the file replaces the section' '--unshare-net' "$ERR_OUT"
+is    'the shell of the section replaces the default' '/bin/sh' "$(uprobe 'echo "$SHELL"' -u other)"
+
+# A hidden path shows a difference only where the sandbox shows the host.
+mkdir -p "$VISIBLE/per-user/config" "$VISIBLE/per-user/section"
+echo config > "$VISIBLE/per-user/config/file"
+echo section > "$VISIBLE/per-user/section/file"
+both_hidden='echo $(cat '"$VISIBLE"'/per-user/config/file '"$VISIBLE"'/per-user/section/file 2>/dev/null)'
+user_config "hide = [\"$VISIBLE/per-user/config\"]" '[users.other]' "hide = [\"$VISIBLE/per-user/section\"]"
+user_file
+if [ "$(uprobe 'cat '"$VISIBLE"'/per-user/section/file 2>/dev/null || echo gone')" = gone ]; then
+    skip 'per-user hidden paths' "the sandbox does not show $VISIBLE; set CORRAL_TEST_VISIBLE"
+else
+    is 'hidden paths add up' '' "$(uprobe "$both_hidden" -u other)"
+    is 'the section hides only for its user' 'section' "$(uprobe "$both_hidden")"
+fi
+
+# A command can ask for a passphrase, so only the commands of the user that
+# starts may run.
+user_config '[users.other]' "env = [\"X=\$(touch $TMP/per-user/section-ran)\"]"
+user_file "env = [\"Y=\$(touch $TMP/per-user/file-ran && printf %s-%s user secret)\"]"
+user_ran() {
+    echo $([ -e "$TMP/per-user/section-ran" ] && echo section
+           [ -e "$TMP/per-user/file-ran" ] && echo file)
+}
+uprobe true >/dev/null
+is 'the commands of another user never run' '' "$(user_ran)"
+(cd "$PROJECT" && XDG_CONFIG_HOME="$UCFG" "$CORRAL_BIN" list >/dev/null 2>&1)
+is 'list runs none of them' '' "$(user_ran)"
+is 'a command in the file of the user fills a variable' 'user-secret' \
+   "$(uprobe 'echo "$Y"' -u other)"
+is 'the commands of the section and of the file run' 'section file' "$(user_ran)"
+uerr -u other --dry-run
+has   'the line of the file shows the command as written' "$USER_FILE: -e 'Y=\$(touch" "$ERR_OUT"
+hasnt 'and not its output' 'user-secret' "$(printf '%s\n' "$ERR_OUT" | grep -F "$USER_FILE")"
+
+# 'list' and 'remove' find the homes with the 'homes' of the config, and the
+# user is known before its section is read. A typo would do nothing.
+user_config '[users.other]' 'homes = "/elsewhere"'
+user_file
+uerr -u other --dry-run
+isnt 'the section cannot move the homes root' '0' "$PSTATUS"
+has  'the refusal names the key and the section' "'homes' in '$UCFG_FILE [users.other]'" "$ERR_OUT"
+user_config
+user_file 'default_user = "corral"'
+uerr -u other --dry-run
+isnt 'the file cannot choose the user' '0' "$PSTATUS"
+has  'the refusal names the key and the file' "'default_user' in '$USER_FILE'" "$ERR_OUT"
+user_file 'mount = ["/tmp"]'
+uerr -u other --dry-run
+isnt 'an unknown key in the file is refused' '0' "$PSTATUS"
+user_file 'mounts = ['
+uerr -u other --dry-run
+isnt 'malformed TOML in the file is refused' '0' "$PSTATUS"
+has  'the refusal names the file' "$USER_FILE" "$ERR_OUT"
+user_file 'mounts = "/tmp"'
+uerr -u other --dry-run
+has  'mounts that are not a list name the file' "'mounts' in '$USER_FILE'" "$ERR_OUT"
+user_file 'mounts = ["../sibling"]'
+uerr -u other --dry-run
+has  'a relative mount names the file' "in '$USER_FILE': the host path must be absolute" "$ERR_OUT"
+user_file 'mounts = ["~"]'
+uerr -u other --force --dry-run
+isnt 'a mount of the home from the file is refused, also with --force' '0' "$PSTATUS"
+has  'the refusal names the file' "The config '$USER_FILE' cannot ask for it" "$ERR_OUT"
+user_file 'hide = ["relative"]'
+uerr -u other --dry-run
+has  'a relative hidden path names the file' "under 'hide' in '$USER_FILE'" "$ERR_OUT"
+user_file 'env = ["X=$(exit 3)"]'
+uerr -u other --dry-run
+has  'a failed command names the key and the file' "for 'env' in '$USER_FILE'" "$ERR_OUT"
+user_file
+user_config '[users.other]' 'shell = "relative"'
+uerr -u other --dry-run
+has  'an invalid shell names the section' "invalid 'shell' in '$UCFG_FILE [users.other]'" "$ERR_OUT"
+user_config '[users]' 'other = "x"'
+uerr -u other --dry-run
+isnt 'a section that is not a table is refused' '0' "$PSTATUS"
+
+# A user that needs a tunnel needs it at every start, so the vpn key does
+# what --vpn does. A start in another network mode stops: the user asked for
+# every packet to go through the tunnel.
+WGCONF="$TMP/per-user/wg.conf"
+FLAGCONF="$TMP/per-user/flag.conf"
+for conf in "$WGCONF" "$FLAGCONF"; do
+    printf '[Interface]\nPrivateKey = unused\nAddress = 10.99.0.2/32\n[Peer]\nPublicKey = unused\n' \
+        > "$conf"
+done
+user_config "vpn = \"$WGCONF\""
+uerr --dry-run
+isnt 'a vpn in the config needs the private mode' '0' "$PSTATUS"
+has  'the refusal names the key and the config' \
+     "'vpn' in '$UCFG_FILE' needs the network mode 'private'" "$ERR_OUT"
+user_config '[users.other]' 'network = "private"' 'vpn = "wg.conf"'
+uerr -u other --dry-run
+isnt 'a relative vpn path is refused' '0' "$PSTATUS"
+has  'the refusal names the section' "'vpn' in '$UCFG_FILE [users.other]'" "$ERR_OUT"
+if command -v pasta >/dev/null && command -v wg >/dev/null; then
+    user_config '[users.other]' 'network = "private"' "vpn = \"$WGCONF\""
+    from_key=$(cd "$PROJECT" && XDG_CONFIG_HOME="$UCFG" "$CORRAL_BIN" -u other --dry-run 2>/dev/null)
+    has  'the vpn key starts the tunnel' "--vpn-helper $WGCONF" "$from_key"
+    uerr -u other --dry-run
+    has  'the line of the section shows the vpn' "$UCFG_FILE [users.other]: --vpn $WGCONF" "$ERR_OUT"
+    uerr -u other --vpn "$FLAGCONF" --dry-run
+    has  'the --vpn flag replaces the key' "--vpn-helper $FLAGCONF" "$ERR_OUT"
+    hasnt 'and the line leaves the key out' "--vpn $WGCONF" "$ERR_OUT"
+    user_config '[users.other]' 'network = "private"'
+    is   'the vpn key does what --vpn does' "$from_key" \
+         "$(cd "$PROJECT" && XDG_CONFIG_HOME="$UCFG" "$CORRAL_BIN" -u other --vpn "$WGCONF" \
+            --dry-run 2>/dev/null)"
+else
+    skip 'the vpn key starts the tunnel' 'pasta or wg is not on PATH'
+fi
+# A '.corral.toml' comes with a repository. Its author could send all the
+# traffic of the sandbox to a server of their own.
+printf 'vpn = "%s"\n' "$WGCONF" > "$TMP/per-user/project/.corral.toml"
+XDG_CONFIG_HOME="$UCFG" corral_err "$TMP/per-user/project" -n private --dry-run
+isnt 'a project file cannot name a VPN' '0' "$PSTATUS"
 
 
 section 'daemon sockets'

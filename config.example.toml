@@ -52,3 +52,13 @@ hide = [
     "/mnt/data/develop",
     "/run/user-daemon/control.sock",
 ]
+
+# Settings of one sandbox user, after the keys above. The file
+# ~/.config/corral/users/NAME.toml holds the same keys and applies after this
+# section. A user can set network, vpn, shell, mounts, env and hide.
+[users.torrent]
+network = "private"
+# The wg-quick config of a WireGuard tunnel for all the traffic, the same as
+# --vpn. It needs the "private" network mode.
+vpn = "~/.config/wireguard/torrent.conf"
+mounts = ["~/Downloads/torrent:~/Downloads:rw"]

@@ -92,6 +92,8 @@ The config is `~/.config/corral/config.toml`, or the same path under
 | `hide` | more files and directories to hide, see [Filesystem](#filesystem) |
 | `shell` | interactive shell, default `$SHELL`, see [Running a command](#running-a-command) |
 | `key_command` | command that prints the passphrase of an encrypted home, see [Encrypted homes](#encrypted-homes) |
+| `vpn` | the same as `--vpn`, see [VPN](#vpn) |
+| `users` | settings of one sandbox user, see [Settings per user](#settings-per-user) |
 
 A value can contain `$(command)`, `$NAME` and `${NAME}`, so the file can name
 a secret without the secret in it:
@@ -105,12 +107,38 @@ as stdin, so `pass` can ask for the passphrase. A failed command or an unset
 variable stops the run. `$$` is a literal `$`.
 
 A host path under `mounts` must be absolute or start with `~`, and `--force`
-does not apply to it. Every start prints the config mounts and variables on
-stderr, as written, not expanded. A literal `NAME=VALUE` shows its value:
+does not apply to it. Every start prints the config mounts, variables and VPN
+on stderr, as written, not expanded. A literal `NAME=VALUE` shows its value:
 
 ```
 $ corral
 /home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -e RUST_LOG=debug
+```
+
+## Settings per user
+
+A section `[users.NAME]` of the config, and a file
+`~/.config/corral/users/NAME.toml`, apply only when the sandbox user is NAME.
+They can set `network`, `vpn`, `shell`, `mounts`, `env` and `hide`. For
+example, a user that downloads through a VPN:
+
+```toml
+[users.torrent]
+network = "private"
+vpn = "~/.config/wireguard/torrent.conf"
+mounts = ["~/Downloads/torrent:~/Downloads:rw"]
+```
+
+The order is the config, the section, then the file. `network`, `vpn` and
+`shell` replace the earlier value. `mounts`, `env` and `hide` add up, and a
+later entry for the same target or name wins. The values expand as in the
+config, but only the values of the user that starts. `list`, `remove`,
+`encrypt` and `check` do not read them. Each source prints its own line:
+
+```
+$ corral -u torrent
+/home/you/.config/corral/config.toml: -m '~/datasets:/data:ro' -e RUST_LOG=debug
+/home/you/.config/corral/config.toml [users.torrent]: -m '~/Downloads/torrent:~/Downloads:rw' --vpn '~/.config/wireguard/torrent.conf'
 ```
 
 ## The project file
@@ -125,8 +153,8 @@ mounts = ["../core", "/data/fixtures:/data:ro"]
 env = ["RUST_LOG=debug"]
 ```
 
-The order is config, then project file, then flags. `-n` and `-u` replace the
-earlier value. Mounts and variables add up, and a later entry for the same
+The order is config, then the [settings of the user](#settings-per-user), then
+project file, then flags. `-n` and `-u` replace the earlier value. Mounts and variables add up, and a later entry for the same
 target or name wins.
 
 The file comes with a repository, so corral trusts it less than the config. It
@@ -390,6 +418,11 @@ loopback, or to let the host reach the sandbox.
 `--vpn FILE` sends all the traffic of the sandbox through a WireGuard
 tunnel, independently from the host and without root. FILE is a wg-quick
 config, as a VPN provider gives it. `--vpn` needs the `private` mode.
+
+The `vpn` key of the config, or of a [user](#settings-per-user), does the same,
+and `--vpn` replaces it. With the key and another network mode, corral stops:
+it does not start without the tunnel. A `.corral.toml` cannot name a VPN,
+because its author could then send all your traffic to their own server.
 
 corral makes the WireGuard interface in the network namespace of `pasta`,
 so the encrypted packets leave through `pasta`. Then it moves the interface
