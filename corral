@@ -30,7 +30,7 @@ CONFIG_PATH = XDG_CONFIG_HOME / "corral" / "config.toml"
 # the user, and 'list' finds every home with the 'homes' of the config.
 # 'key_command' gets the user as '$1'.
 USERS_DIR = XDG_CONFIG_HOME / "corral" / "users"
-USER_KEYS = ("network", "vpn", "shell", "mounts", "env", "hide")
+USER_KEYS = ("network", "vpn", "shell", "mounts", "env", "hide", "wayland")
 
 # The flags a project ships with, read from the project directory only. A file
 # found by walking upward is one the caller may never have read.
@@ -195,14 +195,14 @@ def parse_env(spec):
     return name, os.environ[name]
 
 
-def wayland_display():
+def wayland_display(origin):
     display = os.environ.get("WAYLAND_DISPLAY")
     if not display:
-        raise SystemExit("--wayland: WAYLAND_DISPLAY is not set on the host, so there is no "
-                         "display to give")
+        raise SystemExit(f"{origin}: WAYLAND_DISPLAY is not set on the host, so there is no "
+                         f"display to give")
     socket_path = Path(display) if display.startswith("/") else RUNTIME_DIR / display
     if not socket_path.is_socket():
-        raise SystemExit(f"--wayland: '{socket_path}' is not a socket")
+        raise SystemExit(f"{origin}: '{socket_path}' is not a socket")
     return display, socket_path
 
 
@@ -696,6 +696,19 @@ def chosen_vpn(sources, args):
     return Path(path).expanduser(), origin
 
 
+def chosen_wayland(sources, args):
+    """--wayland or --no-wayland, else the 'wayland' key, and what names it."""
+    if args.wayland is not None:
+        return args.wayland, "--wayland"
+    label, wayland = setting(sources, "wayland")
+    if not label:
+        return False, None
+    origin = f"'wayland' in '{label}'"
+    if not isinstance(wayland, bool):
+        raise SystemExit(f"invalid {origin}: expected true or false")
+    return wayland, origin
+
+
 def build_command(sources, project, args, username):
     network = (args.net or project.get("network") or setting(sources, "network")[1]
                or DEFAULT_NETWORK)
@@ -734,8 +747,9 @@ def build_command(sources, project, args, username):
     guard_bwrap_overlay(mounts)
     configured = [spec for specs in config_env(sources, project, args) for spec in specs]
     variables = [parse_env(spec) for spec in configured + project_env(project, args) + args.env]
-    if args.wayland:
-        display, socket_path = wayland_display()
+    wayland, wayland_origin = chosen_wayland(sources, args)
+    if wayland:
+        display, socket_path = wayland_display(wayland_origin)
         mounts.append((socket_path, socket_path, "ro"))
         variables.append(("WAYLAND_DISPLAY", display))
 
@@ -1367,12 +1381,13 @@ def config_env(sources, project, args):
 def config_flags(sources, project, args):
     """What each source adds, as its label and the flags it stands for.
 
-    Every project gets these, so they are the most easily forgotten. A variable
-    or a VPN that a later source, the project file or a flag replaces is left
-    out. SOURCES hold the text as written, so that a secret behind '$(...)'
-    never reaches the terminal.
+    Every project gets these, so they are the most easily forgotten. A
+    variable, a VPN or a display that a later source, the project file or a
+    flag replaces is left out. SOURCES hold the text as written, so that a
+    secret behind '$(...)' never reaches the terminal.
     """
     vpn_label = None if args.vpn else setting(sources, "vpn")[0]
+    wayland_label = None if args.wayland is not None else setting(sources, "wayland")[0]
     lines = []
     for (label, table), env in zip(sources, config_env(sources, project, args)):
         flags = []
@@ -1382,6 +1397,8 @@ def config_flags(sources, project, args):
             flags += ["-e", spec]
         if label == vpn_label:
             flags += ["--vpn", table["vpn"]]
+        if label == wayland_label and table["wayland"]:
+            flags += ["-w"]
         if flags:
             lines.append((label, flags))
     return lines
@@ -1549,8 +1566,9 @@ def main():
     parser.add_argument("--vpn", metavar="FILE",
                         help="send all traffic through the WireGuard tunnel of this wg-quick "
                              "config; needs the 'private' network mode")
-    parser.add_argument("-w", "--wayland", action="store_true",
-                        help="bind the host's Wayland socket, for a GUI program")
+    parser.add_argument("-w", "--wayland", action=argparse.BooleanOptionalAction,
+                        help="bind the host's Wayland socket, for a GUI program; "
+                             "--no-wayland overrides the 'wayland' key")
     parser.add_argument("--force", action="store_true",
                         help="allow the home directory or '/' as the project")
     parser.add_argument("--dry-run", action="store_true", help="print the command and exit")

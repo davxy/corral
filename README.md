@@ -93,6 +93,7 @@ The config is `~/.config/corral/config.toml`, or the same path under
 | `shell` | interactive shell, default `$SHELL`, see [Running a command](#running-a-command) |
 | `key_command` | command that prints the passphrase of an encrypted home, see [Encrypted homes](#encrypted-homes) |
 | `vpn` | the same as `--vpn`, see [VPN](#vpn) |
+| `wayland` | `true` does the same as `-w`, see [GUI programs](#gui-programs) |
 | `users` | settings of one sandbox user, see [Settings per user](#settings-per-user) |
 
 A value can contain `$(command)`, `$NAME` and `${NAME}`, so the file can name
@@ -107,8 +108,9 @@ as stdin, so `pass` can ask for the passphrase. A failed command or an unset
 variable stops the run. `$$` is a literal `$`.
 
 A host path under `mounts` must be absolute or start with `~`, and `--force`
-does not apply to it. Every start prints the config mounts, variables and VPN
-on stderr, as written, not expanded. A literal `NAME=VALUE` shows its value:
+does not apply to it. Every start prints the config mounts, variables, VPN and
+`-w` on stderr, as written, not expanded. A literal `NAME=VALUE` shows its
+value:
 
 ```
 $ corral
@@ -119,8 +121,8 @@ $ corral
 
 A section `[users.NAME]` of the config, and a file
 `~/.config/corral/users/NAME.toml`, apply only when the sandbox user is NAME.
-They can set `network`, `vpn`, `shell`, `mounts`, `env` and `hide`. For
-example, a user that downloads through a VPN:
+They can set `network`, `vpn`, `shell`, `mounts`, `env`, `hide` and
+`wayland`. For example, a user that downloads through a VPN:
 
 ```toml
 [users.torrent]
@@ -129,9 +131,9 @@ vpn = "~/.config/wireguard/torrent.conf"
 mounts = ["~/Downloads/torrent:~/Downloads:rw"]
 ```
 
-The order is the config, the section, then the file. `network`, `vpn` and
-`shell` replace the earlier value. `mounts`, `env` and `hide` add up, and a
-later entry for the same target or name wins. The values expand as in the
+The order is the config, the section, then the file. `network`, `vpn`,
+`shell` and `wayland` replace the earlier value. `mounts`, `env` and `hide`
+add up, and a later entry for the same target or name wins. The values expand as in the
 config, but only the values of the user that starts. `list`, `remove`,
 `encrypt` and `check` do not read them. Each source prints its own line:
 
@@ -352,9 +354,14 @@ corral -w firefox
 GPU, so the program renders in software. For sound, add
 `-m "$XDG_RUNTIME_DIR/pipewire-0"`. That socket also gives the microphone.
 
+`wayland = true` in the config, or for a [user](#settings-per-user), does the
+same as `-w`. `--no-wayland` turns it off for one start. With the key and no
+display on the host, corral stops.
+
 A Wayland client cannot read the input or the windows of other clients, but
 niri and the wlroots compositors give every client screen capture and the
-clipboard without focus. A program with the socket has them too.
+clipboard without focus. A program with the socket has them too. For this
+reason a `.corral.toml` cannot ask for the display.
 
 corral drops `DISPLAY` and does not bind the X11 socket.
 

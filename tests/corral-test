@@ -206,6 +206,87 @@ WAYLAND_DISPLAY=wayland-8 XDG_RUNTIME_DIR="$RT" corral_err "$PROJECT" -w --dry-r
 isnt '-w with a missing socket is refused' '0' "$PSTATUS"
 has  'the refusal names the socket' "$RT/wayland-8" "$ERR_OUT"
 
+# A user that runs GUI programs needs the display at every start, so the
+# 'wayland' key does what -w does. The config, the section of the user and its
+# file can set it, and a later one replaces an earlier one. -w and --no-wayland
+# decide for one start, for example in an ssh session without a display. The
+# key is a boolean, because the text "false" would give the display.
+WCFG="$TMP/wayland-config"
+WCFG_FILE="$WCFG/corral/config.toml"
+WUSER_FILE="$WCFG/corral/users/other.toml"
+mkdir -p "$WCFG/corral/users" "$TMP/wayland-project"
+# wayland_config LINES... - the config: the base keys, then LINES. No user file.
+wayland_config() {
+    printf 'homes = "%s"\ndefault_user = "corral"\nnetwork = "none"\n' "$TMP/homes" > "$WCFG_FILE"
+    printf '%s\n' "$@" >> "$WCFG_FILE"
+    rm -f "$WUSER_FILE"
+}
+wdisplay() { XDG_CONFIG_HOME="$WCFG" display wayland-9 "$@"; }
+werr()     { XDG_CONFIG_HOME="$WCFG" XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=wayland-9 \
+                 corral_err "$PROJECT" "$@"; }
+wdry()     { (cd "$PROJECT" && XDG_CONFIG_HOME="$WCFG" XDG_RUNTIME_DIR="$RT" \
+                 WAYLAND_DISPLAY=wayland-9 "$CORRAL_BIN" -p --dry-run "$@" 2>/dev/null); }
+wlines()   { printf '%s\n' "$ERR_OUT" | grep -F "$WCFG/corral/"; }
+# Not empty when corral fails, so a refused flag cannot pass for 'none'.
+wsocket='ls -A "$XDG_RUNTIME_DIR" | grep . || echo none'
+
+wayland_config 'wayland = true'
+is 'the wayland key binds the socket' 'open' "$(wdisplay "python3 -c '$wl_connect'")"
+from_key=$(wdry)
+wayland_config
+is 'the wayland key does what -w does' "$from_key" "$(wdry -w)"
+wayland_config 'wayland = false'
+is 'wayland = false binds nothing' 'none' "$(wdisplay "$wsocket")"
+is '-w replaces wayland = false' 'wayland-9' "$(wdisplay "$wsocket" -w)"
+wayland_config 'wayland = true'
+is '--no-wayland replaces wayland = true' 'none' "$(wdisplay "$wsocket" --no-wayland)"
+
+wayland_config 'wayland = true' '[users.other]' 'wayland = false'
+is 'the wayland key of the section replaces the config' 'none' "$(wdisplay "$wsocket" -u other)"
+is 'only for its user' 'wayland-9' "$(wdisplay "$wsocket")"
+printf 'wayland = true\n' > "$WUSER_FILE"
+is 'the wayland key of the file replaces the section' 'wayland-9' \
+   "$(wdisplay "$wsocket" -u other)"
+
+wayland_config 'wayland = "false"'
+werr --dry-run
+isnt 'a wayland key that is not a boolean is refused' '0' "$PSTATUS"
+has  'the refusal names the key and the config' "invalid 'wayland' in '$WCFG_FILE'" "$ERR_OUT"
+wayland_config
+printf 'wayland = 1\n' > "$WUSER_FILE"
+werr -u other --dry-run
+has  'and the file of the user' "'wayland' in '$WUSER_FILE': expected true or false" "$ERR_OUT"
+
+# The user asked for the display, so a start without it is an error, as with -w.
+wayland_config 'wayland = true'
+XDG_CONFIG_HOME="$WCFG" WAYLAND_DISPLAY= XDG_RUNTIME_DIR="$RT" corral_err "$PROJECT" --dry-run
+isnt 'the wayland key without a host display stops the start' '0' "$PSTATUS"
+has  'the refusal names the key and the config' \
+     "'wayland' in '$WCFG_FILE': WAYLAND_DISPLAY is not set" "$ERR_OUT"
+XDG_CONFIG_HOME="$WCFG" WAYLAND_DISPLAY= XDG_RUNTIME_DIR="$RT" corral_err "$PROJECT" \
+    --no-wayland --dry-run
+is   '--no-wayland starts without it' '0' "$PSTATUS"
+
+# The display is easy to forget, as the mounts and the variables are.
+wayland_config 'wayland = true' '[users.other]' 'wayland = true'
+werr -u other --dry-run
+is 'only the line of the source in use shows -w' "$WCFG_FILE [users.other]: -w" "$(wlines)"
+werr -u other -w --dry-run
+is 'a -w flag leaves it out' '' "$(wlines)"
+werr -u other --no-wayland --dry-run
+is 'so does --no-wayland' '' "$(wlines)"
+wayland_config 'wayland = false'
+werr --dry-run
+is 'wayland = false adds nothing to the line' '' "$(wlines)"
+
+# On niri and the wlroots compositors, the socket gives screen capture and the
+# clipboard. A '.corral.toml' comes with a repository, and its author must not
+# get them.
+printf 'wayland = true\n' > "$TMP/wayland-project/.corral.toml"
+XDG_CONFIG_HOME="$WCFG" XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=wayland-9 \
+    corral_err "$TMP/wayland-project" --dry-run
+isnt 'a project file cannot ask for the display' '0' "$PSTATUS"
+
 
 section 'what is writable'
 
@@ -1128,7 +1209,7 @@ keys = set(config).union(*config.get("users", {}).values())
 print(" ".join(sorted(keys)))' "$1" 2>&1
 }
 is 'the example config names every key' \
-   'default_user env hide homes key_command mounts network shell users vpn' \
+   'default_user env hide homes key_command mounts network shell users vpn wayland' \
    "$(toml_keys "$(dirname "$CORRAL_BIN")/config.example.toml")"
 
 # The script holds the version. setup.py reads it from there with the pattern

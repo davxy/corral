@@ -53,9 +53,13 @@ hide = [
     "/run/user-daemon/control.sock",
 ]
 
+# true binds the Wayland socket of the host, the same as -w. --no-wayland
+# turns it off for one start. Without a display on the host, the start stops.
+wayland = false
+
 # Settings of one sandbox user, after the keys above. The file
 # ~/.config/corral/users/NAME.toml holds the same keys and applies after this
-# section. A user can set network, vpn, shell, mounts, env and hide.
+# section. A user can set network, vpn, shell, mounts, env, hide and wayland.
 [users.torrent]
 network = "private"
 # The wg-quick config of a WireGuard tunnel for all the traffic, the same as
